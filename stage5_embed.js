@@ -43,7 +43,11 @@ async function main() {
   const job = compute.for(inputSet, workFunction);
   job.requires(['./embedText', './bgeSmallModelFilesBase64']);
   job.computeGroups = [{ joinKey: 'ibm', joinSecret: 'dcp' }];
-  job.requirements.environment = { webgpu: true };
+  // NOT { webgpu: true } -- this pipeline runs on device:'wasm' (CPU)
+  // everywhere; requiring webgpu-capable workers for a capability nothing
+  // here uses restricts the eligible worker pool for no reason. See
+  // README Gotcha 6 (webgpu shelved) and ingest.js for the fuller note --
+  // confirmed as the real cause of a dispatch that looked stuck for 50+ minutes.
   job.public = {
     name: 'stage5-embed',
     description: 'Stage 5: embed transcript segments (bge-small-en-v1.5) for later retrieval',

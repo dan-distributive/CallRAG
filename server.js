@@ -23,11 +23,21 @@
 //                                    that one clip and names it (reuses the
 //                                    corrections + speakers endpoints' own
 //                                    logic, including voice-profile enrollment)
-//   POST /api/query               -> body: {question, topK}, runs the same
-//                                    retrieval+synthesis as query.js
+//   POST /api/query               -> body: {question, topK, history}, runs
+//                                    the same retrieval+synthesis as
+//                                    query.js -- history is prior turns'
+//                                    {role, content} for follow-up questions
+//   GET  /api/timings              -> per-recording stage-by-stage compute
+//                                    time (ms) from ingest.js -- populated
+//                                    for recordings ingested after this
+//                                    endpoint was added; older ones just won't appear
+//   GET  /api/voice-space          -> every segment's 512-dim voice
+//                                    embedding (see speakerEmbed.js)
+//                                    PCA-projected to 2D for visualization
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const queryEngine = require('./queryEngine');
 
 const PORT = 8177;
 const RESULTS_DIR = path.join(__dirname, 'results');
@@ -66,6 +76,90 @@ function listRecordings() {
   });
 }
 
+function listTimings() {
+  if (!fs.existsSync(RESULTS_DIR)) return [];
+  const files = fs.readdirSync(RESULTS_DIR).filter((f) => f.endsWith('.timings.json'));
+  return files.map((f) => readJSON(path.join(RESULTS_DIR, f), null)).filter(Boolean);
+}
+
+// Plain power-iteration PCA -- projects the 512-dim wavlm voice embeddings
+// (see speakerEmbed.js) down to 2D so they're actually visualizable. No
+// dependency pulled in for this; at these dimensions (a few hundred points,
+// 512 dims) a from-scratch implementation is well under a second.
+function powerIteration(cov, dim, iterations = 100) {
+  let vec = Array.from({ length: dim }, () => Math.random() - 0.5);
+  for (let it = 0; it < iterations; it++) {
+    const next = new Array(dim).fill(0);
+    for (let i = 0; i < dim; i++) {
+      let s = 0;
+      const row = cov[i];
+      for (let j = 0; j < dim; j++) s += row[j] * vec[j];
+      next[i] = s;
+    }
+    const norm = Math.sqrt(next.reduce((s, x) => s + x * x, 0)) || 1;
+    for (let i = 0; i < dim; i++) next[i] = next[i] / norm;
+    vec = next;
+  }
+  return vec;
+}
+
+function pca2D(vectors) {
+  const n = vectors.length;
+  const dim = vectors[0].length;
+
+  const mean = new Array(dim).fill(0);
+  for (const v of vectors) for (let i = 0; i < dim; i++) mean[i] += v[i] / n;
+  const centered = vectors.map((v) => v.map((x, i) => x - mean[i]));
+
+  // Covariance matrix (dim x dim) -- the expensive part, O(n * dim^2).
+  const cov = Array.from({ length: dim }, () => new Array(dim).fill(0));
+  for (const v of centered) {
+    for (let i = 0; i < dim; i++) {
+      const vi = v[i];
+      if (vi === 0) continue;
+      const row = cov[i];
+      for (let j = 0; j < dim; j++) row[j] += vi * v[j];
+    }
+  }
+
+  const pc1 = powerIteration(cov, dim);
+  // Deflate: remove PC1's contribution before finding PC2, or power
+  // iteration just converges to the same dominant direction twice.
+  const covPc1 = pc1.map((_, i) => cov[i].reduce((s, c, j) => s + c * pc1[j], 0));
+  const lambda1 = pc1.reduce((s, x, i) => s + x * covPc1[i], 0);
+  const cov2 = cov.map((row, i) => row.map((c, j) => c - lambda1 * pc1[i] * pc1[j]));
+  const pc2 = powerIteration(cov2, dim);
+
+  return centered.map((v) => [v.reduce((s, x, i) => s + x * pc1[i], 0), v.reduce((s, x, i) => s + x * pc2[i], 0)]);
+}
+
+// Every segment with a voice embedding, projected to 2D. Segments from the
+// same diarization turn share the same embedding (see diarize.js's
+// assignSpeakers) and so land on the same point -- left as-is rather than
+// deduped, since duplicate points just overlap harmlessly and dedup would
+// need to reconstruct turn boundaries that aren't tracked past this point.
+function voiceSpace() {
+  if (!fs.existsSync(RESULTS_DIR)) return [];
+  const files = fs.readdirSync(RESULTS_DIR).filter((f) => f.endsWith('.transcript.json'));
+  const points = [];
+  for (const f of files) {
+    const sourceFile = f.replace(/\.transcript\.json$/, '');
+    const transcript = readJSON(path.join(RESULTS_DIR, f), { segments: [] });
+    const speakerNames = readJSON(path.join(RESULTS_DIR, `${sourceFile}.speakers.json`), {});
+    const corrections = readJSON(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), {});
+    transcript.segments.forEach((seg, i) => {
+      if (!seg.voiceEmbedding) return;
+      const speaker = corrections[i] !== undefined ? corrections[i] : seg.speaker;
+      const label = speakerNames[speaker] ?? seg.voiceMatch?.name ?? null;
+      points.push({ sourceFile, start: seg.start, text: seg.text, speaker, label, embedding: seg.voiceEmbedding });
+    });
+  }
+  if (points.length < 2) return [];
+
+  const coords = pca2D(points.map((p) => p.embedding));
+  return points.map(({ embedding, ...rest }, i) => ({ ...rest, x: coords[i][0], y: coords[i][1] }));
+}
+
 function findAudio(sourceFile) {
   for (const dir of AUDIO_DIRS) {
     const p = path.join(dir, sourceFile);
@@ -98,12 +192,6 @@ function getRecording(sourceFile) {
     };
   });
   return { sourceFile, callDate: transcript.callDate, segments, speakerNames };
-}
-
-function cosineSim(a, b) {
-  let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot;
 }
 
 // Named speakers are only ever local slot-ids per recording (see
@@ -212,108 +300,6 @@ function answerReviewCandidate(sourceFile, segmentIndex, name) {
   updateVoiceProfiles(sourceFile, { [newId]: name });
 }
 
-let embedQueryFn = null;
-async function embedQuery(text) {
-  if (!embedQueryFn) {
-    const installModelFetchPatch = require('./modelFetchPatch');
-    const modelFiles = require('./bgeSmallModelFilesBase64');
-    installModelFetchPatch(modelFiles);
-    const { pipeline, env } = require('@huggingface/transformers');
-    env.allowLocalModels = false;
-    const embedder = await pipeline('feature-extraction', 'Xenova/bge-small-en-v1.5', { dtype: 'q8' });
-    embedQueryFn = async (t) => Array.from((await embedder(t, { pooling: 'mean', normalize: true })).data);
-  }
-  return embedQueryFn(text);
-}
-
-function loadAllSegmentsForQuery() {
-  if (!fs.existsSync(RESULTS_DIR)) return [];
-  const files = fs.readdirSync(RESULTS_DIR).filter((f) => f.endsWith('.embedded.json'));
-  const out = [];
-  for (const f of files) {
-    const sourceFile = f.replace(/\.embedded\.json$/, '');
-    const data = readJSON(path.join(RESULTS_DIR, f), { segments: [] });
-    const speakerNames = readJSON(path.join(RESULTS_DIR, `${sourceFile}.speakers.json`), {});
-    const corrections = readJSON(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), {});
-    data.segments.forEach((seg, i) => {
-      const speaker = corrections[i] !== undefined ? corrections[i] : seg.speaker;
-      out.push({
-        sourceFile,
-        callDate: data.callDate,
-        start: seg.start,
-        end: seg.end,
-        text: seg.text,
-        speaker,
-        speakerName: speakerNames[speaker] ?? seg.voiceMatch?.name ?? null,
-        embedding: seg.embedding,
-      });
-    });
-  }
-  return out;
-}
-
-async function runQuery(question, topK) {
-  const t0 = Date.now();
-  const allSegments = loadAllSegmentsForQuery();
-  const qEmbedding = await embedQuery(question);
-  const ranked = allSegments
-    .map((s) => ({ ...s, score: cosineSim(qEmbedding, s.embedding) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, topK);
-  const retrievalMs = Date.now() - t0;
-
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  const chronological = [...ranked].sort((a, b) => (a.callDate ?? '').localeCompare(b.callDate ?? ''));
-  const context = chronological
-    .map((m, i) => {
-      const when = m.callDate ? new Date(m.callDate).toISOString().slice(0, 16).replace('T', ' ') : 'unknown date';
-      const speaker = m.speakerName ?? (m.speaker != null ? `speaker ${m.speaker}` : 'unknown speaker');
-      return `[${i + 1}] (${when}, ${m.sourceFile} @ ${m.start.toFixed(1)}s-${m.end.toFixed(1)}s, ${speaker}) ${m.text}`;
-    })
-    .join('\n');
-
-  let answer = null;
-  let llmMs = null;
-  if (apiKey) {
-    const t1 = Date.now();
-    try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-5',
-          max_tokens: 1024,
-          messages: [
-            {
-              role: 'user',
-              content: `The excerpts below are from phone/conference calls, given in chronological order with each one's date, source recording, and speaker label. Speaker labels are only consistent WITHIN a single recording unless a real name is shown. Answer the question using only these excerpts, citing excerpt numbers. If the question asks how something evolved or was decided over time, trace it chronologically. If the excerpts don't answer the question, say so.\n\nExcerpts:\n${context}\n\nQuestion: ${question}`,
-            },
-          ],
-        }),
-      });
-      const data = await res.json();
-      answer = res.ok ? data.content.map((c) => c.text).join('') : `LLM error: ${JSON.stringify(data)}`;
-    } catch (err) {
-      answer = `LLM request failed: ${err.message}`;
-    }
-    llmMs = Date.now() - t1;
-  }
-
-  return {
-    matches: ranked.map(({ embedding, ...rest }) => rest),
-    context,
-    answer,
-    stats: {
-      segmentsSearched: allSegments.length,
-      recordingsSearched: new Set(allSegments.map((s) => s.sourceFile)).size,
-      topScore: ranked[0]?.score ?? null,
-      retrievalMs,
-      llmMs,
-      usedLLM: !!apiKey,
-      totalMs: Date.now() - t0,
-    },
-  };
-}
 
 function sendJSON(res, status, obj) {
   const body = JSON.stringify(obj);
@@ -385,6 +371,14 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, listReviewCandidates());
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/timings') {
+      return sendJSON(res, 200, listTimings());
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/voice-space') {
+      return sendJSON(res, 200, voiceSpace());
+    }
+
     if (req.method === 'POST' && url.pathname === '/api/review/answer') {
       const { sourceFile, segmentIndex, name } = await readBody(req);
       if (!sourceFile || segmentIndex == null || !name) {
@@ -426,9 +420,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'POST' && url.pathname === '/api/query') {
-      const { question, topK } = await readBody(req);
+      const { question, topK, history } = await readBody(req);
       if (!question) return sendJSON(res, 400, { error: 'question is required' });
-      const result = await runQuery(question, Number(topK) || 8);
+      const result = await queryEngine.runQuery(question, Number(topK) || 8, Array.isArray(history) ? history : []);
       return sendJSON(res, 200, result);
     }
 

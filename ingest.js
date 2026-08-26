@@ -52,6 +52,14 @@ async function main() {
       console.warn(`${r.sourceFile}: transcribed (${r.segments.length} segments) but embedding failed -- ${r.embedError}`);
     }
     if (r.timings) console.log(`  stage breakdown (s): ${JSON.stringify(Object.fromEntries(Object.entries(r.timings).map(([k, v]) => [k, (v / 1000).toFixed(1)])))}`);
+
+    if (r.timings) {
+      const durationSec = r.segments.length ? r.segments[r.segments.length - 1].end : 0;
+      fs.writeFileSync(
+        `${resultsDir}/${r.sourceFile}.timings.json`,
+        JSON.stringify({ sourceFile: r.sourceFile, callDate, durationSec, segmentCount: r.segments.length, timings: r.timings }, null, 2),
+      );
+    }
   }
 
   const allMp3s = fs.readdirSync(dir).filter((f) => f.toLowerCase().endsWith('.mp3'));
@@ -82,6 +90,23 @@ async function main() {
     const t0 = Date.now();
     const timings = {};
 
+    // diarize()'s/speakerEmbed()'s/transcribeAudio()'s per-chunk/per-token
+    // callbacks are only there to satisfy DCP's ENOPROGRESS timeout (jobs
+    // killed if progress() isn't called for ~30s) -- calling the real
+    // progress() far more often than that (per token, easily several times
+    // a second) is just noise in anything watching the job's console.
+    // Gate it to at most once a second; the exact percentage reported on a
+    // gated-out call is lost, but the next call within the loop reports
+    // whatever's current, so nothing meaningful is missed.
+    let lastProgressAt = 0;
+    function throttledProgress(value) {
+      const now = Date.now();
+      if (now - lastProgressAt >= 1000) {
+        lastProgressAt = now;
+        progress(value);
+      }
+    }
+
     const mp3Bytes = base64.base64ToBytes(unit.mp3Base64);
     const { mono, sampleRate } = await decodeMp3(mp3Bytes);
     // transformers.js's audio pipelines only resample when given a
@@ -111,7 +136,7 @@ async function main() {
     let diarizeChunksDone = 0;
     const turns = await diarize(resampled, pyannoteModelFiles, () => {
       diarizeChunksDone++;
-      progress(0.1 + 0.1 * (diarizeChunksDone / totalDiarizeChunks));
+      throttledProgress(0.1 + 0.1 * (diarizeChunksDone / totalDiarizeChunks));
     });
     timings.diarize = Date.now() - t0 - timings.decodeAndResample;
     progress(0.2);
@@ -130,7 +155,7 @@ async function main() {
       const voiceEmbedding = await speakerEmbed(resampled.subarray(startSample, endSample), wavlmModelFiles);
       const voiceMatch = voiceEmbedding ? matchVoice(voiceEmbedding, voiceProfiles) : null;
       turnsWithVoice.push({ ...turn, voiceEmbedding, voiceMatch });
-      progress(0.2 + 0.05 * ((i + 1) / turns.length)); // a real recording can have hundreds of turns -- same ENOPROGRESS risk as diarize()/transcribeAudio()
+      throttledProgress(0.2 + 0.05 * ((i + 1) / turns.length)); // a real recording can have hundreds of turns -- same ENOPROGRESS risk as diarize()/transcribeAudio()
     }
     timings.speakerEmbed = Date.now() - t0 - timings.decodeAndResample - timings.diarize;
 
@@ -150,7 +175,7 @@ async function main() {
     let transcribeTokens = 0;
     const rawSegments = await transcribeAudio(trimmed, whisperModelFiles, 'uint8', 'Xenova/whisper-base.en', () => {
       transcribeTokens++;
-      progress(0.4 + 0.1 * (1 - 1 / (1 + transcribeTokens / 200)));
+      throttledProgress(0.4 + 0.1 * (1 - 1 / (1 + transcribeTokens / 200)));
     });
     timings.transcribe = Date.now() - t0 - timings.decodeAndResample - timings.diarize - timings.speakerEmbed - timings.vad;
     const withTime = rawSegments.map((s) => ({
@@ -177,7 +202,7 @@ async function main() {
         } catch (err) {
           console.warn(`embed failed for segment ${i} (${seg.text.length} chars), skipping:`, err.message);
         }
-        progress(0.5 + 0.5 * ((i + 1) / segments.length));
+        throttledProgress(0.5 + 0.5 * ((i + 1) / segments.length));
       }
     } catch (err) {
       embedded = undefined;
@@ -203,11 +228,48 @@ async function main() {
   // (see server.js) -- passed in fresh on every dispatch so newly-named
   // speakers get recognized on the NEXT file processed, not retroactively.
   const voiceProfiles = readJSON(`${resultsDir}/voiceProfiles.json`, {});
+  
+  // DCP JOB
   const job = compute.for(inputSet, pipelineWork, [whisperModelFiles, bgeModelFiles, pyannoteModelFiles, wavlmModelFiles, voiceProfiles]);
-  job.requires(['./base64', './decodeMp3', './resample', './vad', './transcribeAudio', './embedText', './diarize', './speakerEmbed']);
-  job.computeGroups = [{ joinKey: 'ssc-icelab', joinSecret: 'r2whez1w' }];
-  job.requirements.environment = { webgpu: true };
-  job.public = { name: 'ingest-pipeline', description: `Batch transcribe+embed ${toProcess.length} file(s)` };
+  
+  // Require local modules
+  job.requires([
+    './base64',
+    './decodeMp3',
+    './resample',
+    './vad',
+    './transcribeAudio',
+    './embedText',
+    './diarize',
+    './speakerEmbed'
+  ]);
+
+  // COMPUTE GROUP(S)
+  job.computeGroups = [
+    { joinKey: 'ssc-icelab', joinSecret: 'r2whez1w' }
+  ];
+
+  // JOB REQUIREMENTS
+  // NOT `{ webgpu: true }` -- this whole pipeline runs on device:'wasm'
+  // (CPU) everywhere; WebGPU was investigated and shelved (uncatchable
+  // crash in onnxruntime-web's JSEP session creation -- see README Gotcha
+  // 6). Requiring webgpu:true here restricted the eligible worker pool to
+  // only GPU-capable devices for a capability nothing in the job actually
+  // uses -- confirmed as the real cause of a dispatch that looked "stuck"
+  // for 50+ minutes (an empty compute group was the first suspicion, but
+  // this was the actual blocker: plenty of workers existed, almost none of
+  // them GPU-capable).
+
+  // JOB PUBLIC INFO
+  job.public = { 
+    name: '📞 CallRAG ingest-pipeline', 
+    description: `Batch transcribe+embed ${toProcess.length} file(s)`,
+    link: 'https://distributive.network',
+  };
+
+  // EVENTS
+  job.on('readystatechange', (ev) => console.log(`[${new Date().toISOString()}] ready state: ${ev}`));
+  job.on('accepted', () => console.log(`  Job id: ${job.id}`));
   job.on('console', (con) => console.dir(con, { depth: Infinity }));
   job.on('error', (error) => console.error('  Job error:', error));
   // Persist each file's result as soon as its slice completes, rather than
@@ -218,6 +280,7 @@ async function main() {
     else console.error('  Slice error:', ev);
   });
 
+  // EXEC
   await job.exec();
 }
 require('dcp-client').init('https://scheduler.distributed.computer').then(main);

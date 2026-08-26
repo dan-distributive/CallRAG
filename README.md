@@ -223,6 +223,21 @@ gets slow on the dispatch/upload side rather than the compute side.
     count isn't knowable in advance the way diarization's/speaker-embedding's
     chunk counts are.
 
+15. **`job.requirements.environment = { webgpu: true }` silently shrinks the
+    eligible worker pool to almost nothing, even though nothing in the job
+    uses WebGPU.** This pipeline runs on `device: 'wasm'` (CPU) everywhere —
+    WebGPU was investigated and shelved (Gotcha 6) — but a leftover
+    requirement from that investigation kept requiring WebGPU-*capable*
+    workers to even be offered the job at all. The result looks exactly
+    like a hung dispatch: `readystatechange` never advances, zero console
+    output, near-zero local CPU usage, for 50+ minutes — genuinely
+    indistinguishable from an empty/unreachable compute group without
+    knowing to suspect this specific line, since the job isn't stuck, it's
+    just waiting for a worker capability that almost nothing has and that
+    the job never actually needed. Fixed by removing the requirement
+    entirely (commented out, not deleted, in case a real future WebGPU
+    attempt wants it back).
+
 ## Speaker identity (voice-fingerprint matching)
 
 `pyannote-segmentation-3.0` alone only answers "when did the speaker
@@ -247,6 +262,40 @@ a different recording of the same speaker from scratch, produced
 This only applies going forward: recordings ingested before this feature
 existed have no `voiceEmbedding` data to enroll from, so folding older
 files into voice-based recognition means re-ingesting them.
+
+## Chat, and swapping in a different LLM
+
+Retrieval and synthesis run entirely locally except for one optional
+network call: the actual LLM chat completion, made through `llm.js`, a
+provider-agnostic interface. Default is Claude (`LLM_PROVIDER=anthropic`,
+the default if unset), reading `ANTHROPIC_API_KEY` from the environment.
+Set `LLM_PROVIDER=local` and `LLM_BASE_URL` to point at any OpenAI
+chat-completions-compatible server instead — Ollama, vLLM, llama.cpp's
+server mode, and LM Studio all implement that shape natively, so this
+should work as a drop-in swap with no code changes. **Caveat:** the local
+path is structurally complete but was built and tested without an actual
+local LLM server available — the request/response shape matches the
+documented OpenAI spec, but "matches the spec" isn't the same as "verified
+against a real server."
+
+`queryEngine.js` is the shared retrieval+synthesis logic behind both the
+viewer's chat panel and the `query.js` CLI (previously duplicated between
+them — now one module, one behavior). Rather than one fixed top-K
+retrieval pass, the LLM gets a `search_calls` tool and can call it again
+(up to 4 rounds) to dig further on its own — the single highest-value
+change identified when planning this, since a fixed top-K often can't
+surface a topic thinly scattered across many calls, which is exactly the
+kind of query this project was built toward. The chat panel also carries
+conversation history across turns for follow-up questions, sent fresh with
+each request (client keeps history, server is stateless per-request).
+
+Two things about the LLM call specifically that shape the architecture:
+it cannot move into the browser the way the retrieval/embedding half
+conceivably could (Anthropic's API doesn't send CORS headers permitting
+direct browser calls, and putting an API key in page source would expose
+it to anyone opening devtools), and none of the rest of the app — browsing,
+playback, corrections, review queue, voice-space, performance — needs a
+key at all; only the synthesized-answer step does.
 
 ## Known limitations
 
@@ -273,9 +322,15 @@ files into voice-based recognition means re-ingesting them.
 
 - `ingest.js` — the main entry point: batch transcribe+diarize+embed a
   directory of mp3s via one DCP job.
-- `query.js` / `server.js` — local retrieval + LLM synthesis (no DCP
-  dispatch); `server.js` also backs the `viewer.html` UI, including the
-  Needs Review / voice-enrollment endpoints.
+- `query.js` — CLI for the same retrieval+synthesis as the viewer's chat
+  panel (no DCP dispatch).
+- `server.js` — backs `viewer.html`: recordings, playback, corrections,
+  voice enrollment, Needs Review, voice-space visualization, performance
+  timings, and the `/api/query` chat endpoint.
+- `queryEngine.js` — shared retrieval + agentic (tool-use) synthesis logic
+  used by both `query.js` and `server.js`.
+- `llm.js` — provider-agnostic chat interface (Claude by default, or any
+  OpenAI-compatible local server) that `queryEngine.js` calls through.
 - `decodeMp3.js`, `resample.js`, `vad.js`, `transcribeAudio.js`,
   `embedText.js`, `diarize.js`, `speakerEmbed.js` — independently-reusable
   pipeline stage modules, each taking model files as a parameter rather

@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>CallRAG Viewer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%93%9E</text></svg>">
 <style>
   :root {
     color-scheme: light;
@@ -167,12 +168,52 @@
     line-height: 1.6;
   }
   #questionInput { width: 100%; resize: vertical; }
+
+  #chatThread { max-height: 460px; overflow-y: auto; margin-top: 12px; }
+  .chatTurn { padding: 12px 0; border-top: 1px solid var(--border-soft); }
+  .chatTurn:first-child { border-top: none; padding-top: 0; }
+  .chatQuestion { font-weight: 600; font-size: 13.5px; margin-bottom: 8px; }
+  .chatAnswer { white-space: pre-wrap; font-size: 13.5px; line-height: 1.6; }
+  .chatAnswer.pending { color: var(--text-faint); font-style: italic; }
+  .chatMeta { font-size: 11px; color: var(--text-faint); margin-top: 8px; }
+  .chatSearchLog { font-size: 11px; color: var(--text-faint); margin-top: 6px; }
+  .chatMatches { margin-top: 8px; }
+  .chatMatches summary { font-size: 11px; color: var(--text-faint); cursor: pointer; }
+
+  .tabs { display: flex; gap: 4px; margin-bottom: 20px; border-bottom: 1px solid var(--border); }
+  .tabBtn {
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: transparent;
+    padding: 8px 4px;
+    margin-right: 20px;
+    color: var(--text-faint);
+    font-weight: 500;
+  }
+  .tabBtn:hover { background: transparent; color: var(--text-muted); }
+  .tabBtn.active { color: var(--text); border-bottom-color: var(--text); }
+
+  #timingsTableWrap table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  #timingsTableWrap th { text-align: left; font-weight: 600; color: var(--text-faint); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  #timingsTableWrap td { padding: 6px 10px; border-bottom: 1px solid var(--border-soft); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  #timingsTableWrap td.stagebar { min-width: 140px; }
+  .stagebar-track { display: flex; height: 14px; border-radius: 3px; overflow: hidden; background: var(--accent-soft); }
+  .stagebar-seg { height: 100%; }
 </style>
 </head>
 <body>
 <div class="page">
 
-<h1>CallRAG</h1>
+<h1>📞 CallRAG</h1>
+
+<div class="tabs">
+  <button class="tabBtn active" data-tab="tabExplore">Explore</button>
+  <button class="tabBtn" data-tab="tabVoices">Voices</button>
+  <button class="tabBtn" data-tab="tabPerformance">Performance</button>
+</div>
+
+<div id="tabExplore">
 
 <div class="panel">
   <h2>Recording</h2>
@@ -207,14 +248,41 @@
 </div>
 
 <div class="panel">
-  <h2>Query</h2>
-  <textarea id="questionInput" rows="2" placeholder="Ask something across all ingested calls…"></textarea>
-  <div style="margin-top:10px; display:flex; align-items:center; gap:10px">
-    <label style="font-size:12px; color:var(--text-muted)">top K</label>
-    <input type="text" id="topK" value="8" style="width:40px">
-    <button class="primary" id="askBtn">Ask</button>
+  <div style="display:flex; align-items:baseline; justify-content:space-between">
+    <h2 style="margin-bottom:0">Chat</h2>
+    <button id="newChatBtn" style="font-size:11px; padding:3px 10px">New chat</button>
   </div>
-  <div id="queryResults"></div>
+  <div id="chatThread"></div>
+  <div style="margin-top:10px; display:flex; align-items:flex-end; gap:10px">
+    <textarea id="questionInput" rows="2" placeholder="Ask something across all ingested calls…" style="flex:1"></textarea>
+    <button class="primary" id="askBtn">Send</button>
+  </div>
+  <div style="margin-top:6px"><label style="font-size:11px; color:var(--text-faint)">top K per search <input type="text" id="topK" value="8" style="width:36px; font-size:11px; padding:2px 4px"></label></div>
+</div>
+
+</div>
+
+<div id="tabVoices" style="display:none">
+  <div class="panel">
+    <h2>Voice fingerprint space</h2>
+    <p style="font-size:12px; color:var(--text-muted); margin-top:-6px">
+      Every clip's 512-dim voice embedding (see speakerEmbed.js), projected to 2D via PCA.
+      Tight clusters of the same color are the voice-matching system agreeing with itself;
+      a point sitting between clusters, or an unnamed (outlined) point near a named cluster,
+      is worth a look in Needs Review. Click a point to jump to it.
+    </p>
+    <div id="voiceSpaceLegend" class="legend" style="margin:10px 0"></div>
+    <svg id="voiceSpaceSvg" width="100%" height="440" style="background:var(--accent-soft); border:1px solid var(--border-soft); border-radius:8px; cursor:default"></svg>
+    <div id="voiceSpaceTooltip" style="font-size:12px; color:var(--text-muted); margin-top:8px; min-height:16px"></div>
+  </div>
+</div>
+
+<div id="tabPerformance" style="display:none">
+  <div class="panel">
+    <h2>Compute time per stage</h2>
+    <div id="timingsSummary" style="font-size:12px; color:var(--text-muted); margin-bottom:14px"></div>
+    <div id="timingsTableWrap" style="overflow-x:auto"></div>
+  </div>
 </div>
 
 </div>
@@ -474,18 +542,31 @@ document.getElementById('timeline').addEventListener('click', (e) => {
   audioEl.currentTime = frac * total;
 });
 
-document.getElementById('askBtn').addEventListener('click', async () => {
-  const question = document.getElementById('questionInput').value.trim();
-  if (!question) return;
-  const topK = Number(document.getElementById('topK').value) || 8;
-  const resultsEl = document.getElementById('queryResults');
-  resultsEl.innerHTML = '<p style="color:#888">Searching...</p>';
+// chatHistory holds only the human-visible {role, content} pairs sent back
+// to queryEngine.js for follow-up context -- not the internal tool-use
+// exchange within a single turn (search rounds), which queryEngine.js
+// re-derives fresh every turn from a new search rooted in that turn's question.
+let chatHistory = [];
 
-  const res = await fetch('/api/query', {
-    method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ question, topK })
-  }).then(r => r.json());
+function renderChatTurn(question) {
+  const thread = document.getElementById('chatThread');
+  const turn = document.createElement('div');
+  turn.className = 'chatTurn';
+  turn.innerHTML = `
+    <div class="chatQuestion">${question}</div>
+    <div class="chatAnswer pending">thinking…</div>
+  `;
+  thread.appendChild(turn);
+  thread.scrollTop = thread.scrollHeight;
+  return turn;
+}
 
-  if (res.error) { resultsEl.innerHTML = `<p style="color:#c00">${res.error}</p>`; return; }
+function fillChatTurn(turnEl, res) {
+  const s = res.stats;
+  if (s.error) {
+    turnEl.querySelector('.chatAnswer').outerHTML = `<div class="chatAnswer" style="color:#c00">${s.error}</div>`;
+    return;
+  }
 
   const matchesHtml = res.matches.map((m, i) => `
     <div class="match">
@@ -493,24 +574,173 @@ document.getElementById('askBtn').addEventListener('click', async () => {
       <div>${m.text}</div>
     </div>`).join('');
 
-  const answerHtml = res.answer ? `<div id="answer">${res.answer}</div>` :
-    `<p style="color:#888;font-size:13px">(no ANTHROPIC_API_KEY set on the server -- showing retrieved context only, no synthesized answer)</p>`;
+  // res.searchLog[0] is always the initial fixed-topK pull for this turn --
+  // anything after that is the model deciding on its own to dig further
+  // (see queryEngine.js's tool-use loop), worth surfacing since it's the
+  // whole point of the upgrade over a single fixed retrieval pass.
+  const extraSearches = res.searchLog.slice(1);
+  const searchLogHtml = extraSearches.length
+    ? `<div class="chatSearchLog">searched ${res.searchLog.length} times total:<br>` +
+      extraSearches.map(q => `&nbsp;&nbsp;-> "${q.query}" (${q.resultCount} results)`).join('<br>') + `</div>`
+    : '';
 
-  const s = res.stats;
-  resultsEl.innerHTML = `
+  const answerHtml = res.answer
+    ? `<div class="chatAnswer">${res.answer}</div>${searchLogHtml}`
+    : `<div class="chatAnswer" style="color:var(--text-faint); font-style:normal">(no LLM configured -- see llm.js for LLM_PROVIDER/ANTHROPIC_API_KEY -- showing retrieved matches only)</div>`;
+
+  turnEl.querySelector('.chatAnswer').outerHTML = `
     ${answerHtml}
-    <div class="stats">
-      <div>segments searched: <b>${s.segmentsSearched}</b></div>
-      <div>recordings searched: <b>${s.recordingsSearched}</b></div>
-      <div>top score: <b>${s.topScore != null ? s.topScore.toFixed(3) : 'n/a'}</b></div>
-      <div>retrieval: <b>${s.retrievalMs}ms</b></div>
-      ${s.usedLLM ? `<div>LLM: <b>${s.llmMs}ms</b></div>` : ''}
-      <div>total: <b>${s.totalMs}ms</b></div>
+    <div class="chatMeta">
+      ${s.segmentsSearched} segments across ${s.recordingsSearched} recording(s) --
+      top score ${s.topScore != null ? s.topScore.toFixed(3) : 'n/a'} --
+      ${s.usedLLM ? `${s.searchRounds} search round(s), ${s.usage.input_tokens}+${s.usage.output_tokens} tokens -- ` : ''}
+      ${(s.totalMs/1000).toFixed(1)}s
     </div>
-    <h2 style="margin-top:14px">Matches</h2>
-    ${matchesHtml}
+    <details class="chatMatches"><summary>${res.matches.length} matches</summary>${matchesHtml}</details>
   `;
+}
+
+async function sendChatMessage() {
+  const input = document.getElementById('questionInput');
+  const question = input.value.trim();
+  if (!question) return;
+  input.value = '';
+  const topK = Number(document.getElementById('topK').value) || 8;
+
+  const turnEl = renderChatTurn(question);
+  const res = await fetch('/api/query', {
+    method: 'POST', headers: {'content-type':'application/json'},
+    body: JSON.stringify({ question, topK, history: chatHistory })
+  }).then(r => r.json());
+
+  fillChatTurn(turnEl, res);
+
+  if (res.answer) {
+    chatHistory.push({ role: 'user', content: question });
+    chatHistory.push({ role: 'assistant', content: res.answer });
+  }
+  document.getElementById('chatThread').scrollTop = document.getElementById('chatThread').scrollHeight;
+}
+
+document.getElementById('askBtn').addEventListener('click', sendChatMessage);
+document.getElementById('questionInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChatMessage(); }
 });
+document.getElementById('newChatBtn').addEventListener('click', () => {
+  chatHistory = [];
+  document.getElementById('chatThread').innerHTML = '';
+});
+
+const STAGE_ORDER = ['decodeAndResample', 'diarize', 'speakerEmbed', 'vad', 'transcribe', 'embed'];
+const STAGE_LABELS = { decodeAndResample: 'decode+resample', diarize: 'diarize', speakerEmbed: 'speaker ID', vad: 'VAD', transcribe: 'transcribe', embed: 'embed' };
+const STAGE_COLORS = { decodeAndResample: '#a8a29e', diarize: '#7a52c9', speakerEmbed: '#1c9baa', vad: '#c9a227', transcribe: '#1d6fb8', embed: '#2f9e5e' };
+
+const TAB_IDS = ['tabExplore', 'tabVoices', 'tabPerformance'];
+document.querySelectorAll('.tabBtn').forEach(btn => {
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
+});
+function switchTab(tab) {
+  document.querySelectorAll('.tabBtn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  TAB_IDS.forEach(id => document.getElementById(id).style.display = id === tab ? '' : 'none');
+  if (tab === 'tabPerformance') loadTimings();
+  if (tab === 'tabVoices') loadVoiceSpace();
+}
+
+function colorForLabel(label) {
+  if (!label) return '#999';
+  let hash = 0;
+  for (let i = 0; i < label.length; i++) hash = (hash * 31 + label.charCodeAt(i)) | 0;
+  return PALETTE[Math.abs(hash) % PALETTE.length];
+}
+
+async function loadVoiceSpace() {
+  const points = await fetch('/api/voice-space').then(r => r.json());
+  const svg = document.getElementById('voiceSpaceSvg');
+  const tooltip = document.getElementById('voiceSpaceTooltip');
+  const legendEl = document.getElementById('voiceSpaceLegend');
+  svg.innerHTML = '';
+  tooltip.textContent = '';
+
+  if (points.length < 2) {
+    legendEl.textContent = '';
+    tooltip.textContent = 'Not enough voice-fingerprinted clips yet -- ingest more recordings (this feature only covers clips processed after speakerEmbed.js was added).';
+    return;
+  }
+
+  const W = svg.clientWidth || 800, H = 440, PAD = 30;
+  const xs = points.map(p => p.x), ys = points.map(p => p.y);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const yMin = Math.min(...ys), yMax = Math.max(...ys);
+  const sx = x => PAD + (x - xMin) / ((xMax - xMin) || 1) * (W - 2*PAD);
+  const sy = y => H - PAD - (y - yMin) / ((yMax - yMin) || 1) * (H - 2*PAD);
+
+  const labels = [...new Set(points.map(p => p.label).filter(Boolean))];
+  legendEl.innerHTML = labels.map(l =>
+    `<div class="legend-item"><span class="swatch" style="background:${colorForLabel(l)}"></span>${l}</div>`
+  ).join('') + (points.some(p => !p.label) ? `<div class="legend-item"><span class="swatch" style="background:#999; opacity:0.4"></span>unnamed</div>` : '');
+
+  const ns = 'http://www.w3.org/2000/svg';
+  for (const p of points) {
+    const circle = document.createElementNS(ns, 'circle');
+    circle.setAttribute('cx', sx(p.x));
+    circle.setAttribute('cy', sy(p.y));
+    circle.setAttribute('r', 5);
+    circle.setAttribute('fill', p.label ? colorForLabel(p.label) : 'none');
+    circle.setAttribute('stroke', p.label ? colorForLabel(p.label) : '#999');
+    circle.setAttribute('stroke-width', p.label ? 0 : 1.5);
+    circle.setAttribute('fill-opacity', p.label ? 0.75 : 0);
+    circle.style.cursor = 'pointer';
+    circle.addEventListener('mouseenter', () => {
+      tooltip.textContent = `${p.label ?? 'unnamed (speaker ' + p.speaker + ')'} -- ${p.sourceFile} @ ${p.start.toFixed(1)}s: "${p.text.slice(0,80)}"`;
+    });
+    circle.addEventListener('click', async () => {
+      switchTab('tabExplore');
+      document.getElementById('recordingSelect').value = p.sourceFile;
+      await loadRecording(p.sourceFile);
+      audioEl.currentTime = p.start;
+    });
+    svg.appendChild(circle);
+  }
+}
+
+async function loadTimings() {
+  const rows = await fetch('/api/timings').then(r => r.json());
+  const wrap = document.getElementById('timingsTableWrap');
+  const summaryEl = document.getElementById('timingsSummary');
+
+  if (rows.length === 0) {
+    wrap.innerHTML = '';
+    summaryEl.textContent = 'No timing data yet -- only recordings ingested since this feature was added will show up here.';
+    return;
+  }
+
+  const totalAudioSec = rows.reduce((s, r) => s + r.durationSec, 0);
+  const totalComputeMs = rows.reduce((s, r) => s + r.timings.totalMs, 0);
+  summaryEl.textContent = `${rows.length} recording${rows.length===1?'':'s'} -- ${(totalAudioSec/60).toFixed(1)} min of audio, ${(totalComputeMs/1000/60).toFixed(1)} min of compute (${(totalComputeMs/1000/totalAudioSec).toFixed(2)}x realtime)`;
+
+  const header = `<tr><th>Recording</th><th>Date</th><th>Audio</th><th>Segments</th>` +
+    STAGE_ORDER.map(s => `<th>${STAGE_LABELS[s]}</th>`).join('') + `<th>Total</th><th>Breakdown</th></tr>`;
+
+  const body = rows.map(r => {
+    const t = r.timings;
+    const total = t.totalMs;
+    const bar = STAGE_ORDER.map(s =>
+      `<span class="stagebar-seg" style="background:${STAGE_COLORS[s]}; width:${((t[s]||0)/total*100).toFixed(1)}%" title="${STAGE_LABELS[s]}: ${((t[s]||0)/1000).toFixed(1)}s"></span>`
+    ).join('');
+    const when = r.callDate ? r.callDate.slice(0,10) : 'no date';
+    return `<tr>
+      <td>${r.sourceFile}</td>
+      <td>${when}</td>
+      <td>${r.durationSec.toFixed(0)}s</td>
+      <td>${r.segmentCount}</td>
+      ${STAGE_ORDER.map(s => `<td>${((t[s]||0)/1000).toFixed(1)}s</td>`).join('')}
+      <td><b>${(total/1000).toFixed(1)}s</b></td>
+      <td class="stagebar"><div class="stagebar-track">${bar}</div></td>
+    </tr>`;
+  }).join('');
+
+  wrap.innerHTML = `<table>${header}${body}</table>`;
+}
 
 loadRecordingList();
 loadKnownVoices().then(loadReviewQueue); // sequenced so the review list's autocomplete has known-voice names on first render
