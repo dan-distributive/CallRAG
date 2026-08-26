@@ -23,7 +23,6 @@ async function main() {
   const job = compute.for(inputSet, workFunction);
   job.requires(['./testPipeline']);
   job.computeGroups = [{ joinKey: 'ibm', joinSecret: 'dcp' }];
-  job.requirements = job.requirements || {};
   job.requirements.environment = { webgpu: true };
   job.public = {
     name: 'stage2-transformers-pipeline',

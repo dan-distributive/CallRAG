@@ -205,8 +205,7 @@ async function main() {
   const voiceProfiles = readJSON(`${resultsDir}/voiceProfiles.json`, {});
   const job = compute.for(inputSet, pipelineWork, [whisperModelFiles, bgeModelFiles, pyannoteModelFiles, wavlmModelFiles, voiceProfiles]);
   job.requires(['./base64', './decodeMp3', './resample', './vad', './transcribeAudio', './embedText', './diarize', './speakerEmbed']);
-  job.computeGroups = [{ joinKey: 'ibm', joinSecret: 'dcp' }];
-  job.requirements = job.requirements || {};
+  job.computeGroups = [{ joinKey: 'ssc-icelab', joinSecret: 'r2whez1w' }];
   job.requirements.environment = { webgpu: true };
   job.public = { name: 'ingest-pipeline', description: `Batch transcribe+embed ${toProcess.length} file(s)` };
   job.on('console', (con) => console.dir(con, { depth: Infinity }));
