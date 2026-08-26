@@ -1,0 +1,21 @@
+{
+  "name": "callrag",
+  "version": "1.0.0",
+  "description": "mp3 call recordings -> searchable, LLM-queryable knowledge, via DCP-dispatched transcription/diarization/embedding + local retrieval",
+  "main": "ingest.js",
+  "scripts": {
+    "prepare-models": "node scripts/prepare-models.js",
+    "ingest": "node ingest.js",
+    "query": "node query.js",
+    "viewer": "node server.js"
+  },
+  "keywords": ["dcp", "distributed-computing", "whisper", "diarization", "rag", "transformers.js"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "dcp-client": "^5.8.2",
+    "minimp3-wasm": "^0.1.0"
+  }
+}

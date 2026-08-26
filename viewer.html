@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CallRAG Viewer</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #fafaf9;
+    --panel: #ffffff;
+    --border: #e7e5e4;
+    --border-soft: #f0efed;
+    --text: #292524;
+    --text-muted: #78716c;
+    --text-faint: #a8a29e;
+    --accent: #57534e;
+    --accent-soft: #f5f4f3;
+    --radius: 10px;
+    --serif: Georgia, "Iowan Old Style", "Palatino Linotype", serif;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: var(--sans);
+    margin: 0;
+    padding: 40px 24px;
+    background: var(--bg);
+    color: var(--text);
+    -webkit-font-smoothing: antialiased;
+  }
+  .page { max-width: 760px; margin: 0 auto; }
+
+  h1 {
+    font-family: var(--serif);
+    font-weight: 400;
+    font-size: 26px;
+    margin: 0 0 28px;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  h2 {
+    font-size: 11px;
+    font-weight: 600;
+    margin: 0 0 14px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 24px;
+    margin-bottom: 20px;
+  }
+
+  select, textarea, input[type=text] {
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--text);
+  }
+  select:focus, textarea:focus, input[type=text]:focus {
+    outline: none;
+    border-color: var(--text-faint);
+  }
+  #recordingSelect { width: 100%; }
+
+  button {
+    font: inherit;
+    font-size: 13px;
+    padding: 7px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel);
+    color: var(--text);
+    cursor: pointer;
+    transition: background 0.1s, border-color 0.1s;
+  }
+  button:hover { background: var(--accent-soft); border-color: var(--text-faint); }
+  button.primary { background: var(--text); color: var(--panel); border-color: var(--text); }
+  button.primary:hover { background: var(--accent); border-color: var(--accent); }
+
+  audio { width: 100%; margin: 14px 0 6px; height: 32px; }
+  audio::-webkit-media-controls-panel { background: var(--accent-soft); }
+
+  #timeline {
+    position: relative;
+    height: 28px;
+    background: var(--accent-soft);
+    border: 1px solid var(--border-soft);
+    border-radius: 6px;
+    overflow: hidden;
+    cursor: pointer;
+  }
+  .turn { position: absolute; top: 0; bottom: 0; opacity: 0.88; }
+  .turn:hover { opacity: 1; }
+  #playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--text); pointer-events: none; }
+
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 12px 0 4px; font-size: 12px; }
+  .legend-item { display: flex; align-items: center; gap: 6px; color: var(--text-muted); }
+  .swatch { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+  .legend-item input[type=text] { width: 100px; font-size: 12px; padding: 3px 6px; }
+
+  #transcript { max-height: 420px; overflow-y: auto; margin-top: 16px; }
+  .seg {
+    display: flex;
+    gap: 12px;
+    padding: 9px 6px;
+    border-top: 1px solid var(--border-soft);
+    cursor: pointer;
+    align-items: baseline;
+    font-size: 13px;
+  }
+  .seg:first-child { border-top: none; }
+  .seg:hover { background: var(--accent-soft); }
+  .seg.active { background: #f0ede8; }
+  .seg .time { color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; width: 48px; flex-shrink: 0; }
+  .seg .speaker-tag {
+    font-size: 11px;
+    font-weight: 500;
+    width: 84px;
+    flex-shrink: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-muted);
+    padding: 0;
+  }
+  .seg .text { flex: 1; line-height: 1.5; }
+  .seg.corrected .speaker-tag::after { content: " ·"; color: var(--text-faint); }
+
+  #queryResults { margin-top: 4px; }
+  .match { padding: 12px 0; border-top: 1px solid var(--border-soft); font-size: 13px; line-height: 1.5; }
+  .match:first-child { border-top: none; }
+  .match .meta { color: var(--text-faint); font-size: 11px; margin-bottom: 3px; }
+  .stats {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    color: var(--text-faint);
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--border-soft);
+  }
+  .stats b { color: var(--text-muted); font-weight: 600; }
+  #answer {
+    white-space: pre-wrap;
+    background: var(--accent-soft);
+    border: 1px solid var(--border-soft);
+    padding: 16px;
+    border-radius: 8px;
+    margin-top: 14px;
+    font-size: 13.5px;
+    line-height: 1.6;
+  }
+  #questionInput { width: 100%; resize: vertical; }
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>CallRAG</h1>
+
+<div class="panel">
+  <h2>Recording</h2>
+  <select id="recordingSelect"></select>
+</div>
+
+<div class="panel" id="playerPanel" style="display:none">
+  <h2>Diarization &amp; playback</h2>
+  <div id="timeline"><div id="playhead"></div></div>
+  <div class="legend" id="legend"></div>
+  <audio id="audioEl" controls></audio>
+  <div style="margin-top:10px"><button id="saveNamesBtn">Save speaker names</button></div>
+
+  <h2 style="margin-top:24px">Transcript</h2>
+  <div id="transcript"></div>
+</div>
+
+<div class="panel">
+  <h2>Query</h2>
+  <textarea id="questionInput" rows="2" placeholder="Ask something across all ingested calls…"></textarea>
+  <div style="margin-top:10px; display:flex; align-items:center; gap:10px">
+    <label style="font-size:12px; color:var(--text-muted)">top K</label>
+    <input type="text" id="topK" value="8" style="width:40px">
+    <button class="primary" id="askBtn">Ask</button>
+  </div>
+  <div id="queryResults"></div>
+</div>
+
+</div>
+<script>
+// Distinct hues, moderate-high saturation for clear at-a-glance
+// differentiation between adjacent clips -- not neon, but not muted either.
+const PALETTE = ['#1d6fb8','#d9622b','#2f9e5e','#b8317a','#7a52c9','#c9a227','#1c9baa','#c73e3e'];
+function colorFor(speakerId) {
+  if (speakerId == null) return '#999';
+  return PALETTE[Math.abs(speakerId) % PALETTE.length];
+}
+
+let current = null; // {sourceFile, callDate, segments, speakerNames}
+let audioEl = document.getElementById('audioEl');
+
+async function loadRecordingList() {
+  const recordings = await fetch('/api/recordings').then(r => r.json());
+  const sel = document.getElementById('recordingSelect');
+  sel.innerHTML = '<option value="">-- select a recording --</option>' +
+    recordings.map(r => `<option value="${r.sourceFile}">${r.sourceFile} ${r.callDate ? '(' + r.callDate.slice(0,10) + ')' : ''} -- ${r.segmentCount} segments, ${r.duration.toFixed(0)}s${r.hasAudio ? '' : ' [no audio found]'}</option>`).join('');
+}
+
+async function loadRecording(sourceFile) {
+  if (!sourceFile) { document.getElementById('playerPanel').style.display = 'none'; return; }
+  current = await fetch(`/api/recordings/${encodeURIComponent(sourceFile)}`).then(r => r.json());
+  document.getElementById('playerPanel').style.display = '';
+  audioEl.src = `/audio/${encodeURIComponent(sourceFile)}`;
+  renderTimeline();
+  renderLegend();
+  renderTranscript();
+}
+
+function uniqueSpeakers() {
+  const ids = new Set();
+  for (const s of current.segments) if (s.speaker != null) ids.add(s.speaker);
+  return Array.from(ids).sort((a,b) => a - b);
+}
+
+function renderTimeline() {
+  const el = document.getElementById('timeline');
+  el.querySelectorAll('.turn').forEach(n => n.remove());
+  const total = current.segments.length ? current.segments[current.segments.length - 1].end : 1;
+  for (const seg of current.segments) {
+    const div = document.createElement('div');
+    div.className = 'turn';
+    div.style.left = (seg.start / total * 100) + '%';
+    div.style.width = Math.max(0.3, (seg.end - seg.start) / total * 100) + '%';
+    div.style.background = colorFor(seg.speaker);
+    div.title = `${seg.speakerName ?? 'speaker ' + seg.speaker} @ ${seg.start.toFixed(1)}s: ${seg.text.slice(0,60)}`;
+    div.addEventListener('click', () => { audioEl.currentTime = seg.start; audioEl.play(); });
+    el.appendChild(div);
+  }
+}
+
+function renderLegend() {
+  const el = document.getElementById('legend');
+  el.innerHTML = '';
+  for (const id of uniqueSpeakers()) {
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    item.innerHTML = `<span class="swatch" style="background:${colorFor(id)}"></span> speaker ${id}
+      <input type="text" data-speaker="${id}" placeholder="name..." value="${current.speakerNames[id] ?? ''}">`;
+    el.appendChild(item);
+  }
+}
+
+function renderTranscript() {
+  const el = document.getElementById('transcript');
+  el.innerHTML = '';
+  const speakerOptions = uniqueSpeakers();
+  for (const seg of current.segments) {
+    const row = document.createElement('div');
+    row.className = 'seg' + (seg.corrected ? ' corrected' : '');
+    row.dataset.index = seg.index;
+    row.dataset.start = seg.start;
+    row.dataset.end = seg.end;
+
+    const time = document.createElement('div');
+    time.className = 'time';
+    time.textContent = seg.start.toFixed(1) + 's';
+
+    const speakerTag = document.createElement('select');
+    speakerTag.className = 'speaker-tag';
+    speakerTag.innerHTML = speakerOptions.map(id =>
+      `<option value="${id}" ${id === seg.speaker ? 'selected' : ''}>${current.speakerNames[id] ?? ('spk ' + id)}</option>`
+    ).join('') + `<option value="__new__">+ new speaker</option>`;
+    speakerTag.addEventListener('click', (e) => e.stopPropagation());
+    speakerTag.addEventListener('change', () => onCorrect(seg.index, speakerTag));
+
+    const text = document.createElement('div');
+    text.className = 'text';
+    text.textContent = seg.text;
+
+    row.appendChild(time);
+    row.appendChild(speakerTag);
+    row.appendChild(text);
+    row.addEventListener('click', () => { audioEl.currentTime = seg.start; audioEl.play(); });
+    el.appendChild(row);
+  }
+}
+
+function onCorrect(index, selectEl) {
+  let value = selectEl.value;
+  if (value === '__new__') {
+    const maxId = Math.max(-1, ...uniqueSpeakers());
+    value = String(maxId + 1);
+  }
+  const speakerId = Number(value);
+  current.segments[index].speaker = speakerId;
+  current.segments[index].corrected = true;
+  saveCorrections();
+  renderTimeline();
+  renderLegend();
+  renderTranscript();
+}
+
+async function saveCorrections() {
+  const corrections = {};
+  current.segments.forEach(s => { if (s.corrected) corrections[s.index] = s.speaker; });
+  await fetch(`/api/corrections/${encodeURIComponent(current.sourceFile)}`, {
+    method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(corrections)
+  });
+}
+
+document.getElementById('saveNamesBtn').addEventListener('click', async () => {
+  const names = {};
+  document.querySelectorAll('#legend input[data-speaker]').forEach(inp => {
+    if (inp.value.trim()) names[inp.dataset.speaker] = inp.value.trim();
+  });
+  current.speakerNames = names;
+  await fetch(`/api/speakers/${encodeURIComponent(current.sourceFile)}`, {
+    method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify(names)
+  });
+  renderLegend();
+  renderTranscript();
+  renderTimeline();
+});
+
+document.getElementById('recordingSelect').addEventListener('change', (e) => loadRecording(e.target.value));
+
+// Sync playhead + active transcript row with playback
+audioEl.addEventListener('timeupdate', () => {
+  if (!current || !current.segments.length) return;
+  const total = current.segments[current.segments.length - 1].end || 1;
+  document.getElementById('playhead').style.left = Math.min(100, audioEl.currentTime / total * 100) + '%';
+
+  const rows = document.querySelectorAll('#transcript .seg');
+  let activeRow = null;
+  rows.forEach(row => {
+    const isActive = audioEl.currentTime >= Number(row.dataset.start) && audioEl.currentTime < Number(row.dataset.end);
+    row.classList.toggle('active', isActive);
+    if (isActive) activeRow = row;
+  });
+  if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+});
+
+document.getElementById('timeline').addEventListener('click', (e) => {
+  if (!current) return;
+  const rect = e.currentTarget.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  const total = current.segments.length ? current.segments[current.segments.length - 1].end : 0;
+  audioEl.currentTime = frac * total;
+});
+
+document.getElementById('askBtn').addEventListener('click', async () => {
+  const question = document.getElementById('questionInput').value.trim();
+  if (!question) return;
+  const topK = Number(document.getElementById('topK').value) || 8;
+  const resultsEl = document.getElementById('queryResults');
+  resultsEl.innerHTML = '<p style="color:#888">Searching...</p>';
+
+  const res = await fetch('/api/query', {
+    method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ question, topK })
+  }).then(r => r.json());
+
+  if (res.error) { resultsEl.innerHTML = `<p style="color:#c00">${res.error}</p>`; return; }
+
+  const matchesHtml = res.matches.map((m, i) => `
+    <div class="match">
+      <div class="meta">[${i+1}] score ${m.score.toFixed(3)} -- ${m.sourceFile}${m.callDate ? ' (' + m.callDate.slice(0,10) + ')' : ''} @ ${m.start.toFixed(1)}s -- ${m.speakerName ?? ('speaker ' + m.speaker)}</div>
+      <div>${m.text}</div>
+    </div>`).join('');
+
+  const answerHtml = res.answer ? `<div id="answer">${res.answer}</div>` :
+    `<p style="color:#888;font-size:13px">(no ANTHROPIC_API_KEY set on the server -- showing retrieved context only, no synthesized answer)</p>`;
+
+  const s = res.stats;
+  resultsEl.innerHTML = `
+    ${answerHtml}
+    <div class="stats">
+      <div>segments searched: <b>${s.segmentsSearched}</b></div>
+      <div>recordings searched: <b>${s.recordingsSearched}</b></div>
+      <div>top score: <b>${s.topScore != null ? s.topScore.toFixed(3) : 'n/a'}</b></div>
+      <div>retrieval: <b>${s.retrievalMs}ms</b></div>
+      ${s.usedLLM ? `<div>LLM: <b>${s.llmMs}ms</b></div>` : ''}
+      <div>total: <b>${s.totalMs}ms</b></div>
+    </div>
+    <h2 style="margin-top:14px">Matches</h2>
+    ${matchesHtml}
+  `;
+});
+
+loadRecordingList();
+</script>
+</body>
+</html>
