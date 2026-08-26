@@ -20,7 +20,7 @@ async function writeBundle(outFile, files) {
 }
 
 async function main() {
-  const { pipeline, AutoModelForAudioFrameClassification, AutoProcessor } = require('@huggingface/transformers');
+  const { pipeline, AutoModel, AutoModelForAudioFrameClassification, AutoProcessor } = require('@huggingface/transformers');
 
   console.log('downloading whisper-base.en (uint8)...');
   await pipeline('automatic-speech-recognition', 'Xenova/whisper-base.en', { dtype: 'uint8' });
@@ -53,6 +53,16 @@ async function main() {
     'config.json': `${pyannote}/config.json`,
     'preprocessor_config.json': `${pyannote}/preprocessor_config.json`,
     'onnx/model.onnx': `${pyannote}/onnx/model.onnx`,
+  });
+
+  console.log('downloading wavlm-base-plus-sv (q8)...');
+  await AutoModel.from_pretrained('Xenova/wavlm-base-plus-sv', { dtype: 'q8' });
+  await AutoProcessor.from_pretrained('Xenova/wavlm-base-plus-sv');
+  const wavlm = path.join(ROOT, 'node_modules/@huggingface/transformers/.cache/Xenova/wavlm-base-plus-sv');
+  await writeBundle('wavlmModelFilesBase64.js', {
+    'config.json': `${wavlm}/config.json`,
+    'preprocessor_config.json': `${wavlm}/preprocessor_config.json`,
+    'onnx/model_quantized.onnx': `${wavlm}/onnx/model_quantized.onnx`,
   });
 
   console.log('embedding onnxruntime-web wasm binary...');

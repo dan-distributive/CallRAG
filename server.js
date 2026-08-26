@@ -6,8 +6,23 @@
 //   GET  /api/recordings/:file    -> one recording's segments, with
 //                                    corrections/speaker-names already merged in
 //   GET  /audio/:file             -> the raw mp3 (Range-request aware, for scrubbing)
-//   POST /api/speakers/:file      -> body: {speakerId: name} map, persisted
+//   POST /api/speakers/:file      -> body: {speakerId: name} map, persisted,
+//                                    and enrolls/updates a GLOBAL voice
+//                                    profile per name from that speaker's
+//                                    voice-fingerprint embeddings (see
+//                                    speakerEmbed.js / diarize.js) so future
+//                                    recordings can recognize the same voice
 //   POST /api/corrections/:file   -> body: {segmentIndex: newSpeakerId} map, persisted
+//   GET  /api/voices              -> known global voice profiles (name + clip count)
+//   GET  /api/review              -> every not-yet-confirmed segment across
+//                                    every recording, most uncertain first
+//                                    (no threshold param -- the viewer
+//                                    filters client-side)
+//   POST /api/review/answer       -> body: {sourceFile, segmentIndex, name},
+//                                    assigns a fresh local speaker id to
+//                                    that one clip and names it (reuses the
+//                                    corrections + speakers endpoints' own
+//                                    logic, including voice-profile enrollment)
 //   POST /api/query               -> body: {question, topK}, runs the same
 //                                    retrieval+synthesis as query.js
 const http = require('http');
@@ -66,7 +81,21 @@ function getRecording(sourceFile) {
   const corrections = readJSON(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), {});
   const segments = transcript.segments.map((seg, i) => {
     const speaker = corrections[i] !== undefined ? corrections[i] : seg.speaker;
-    return { ...seg, index: i, speaker, speakerName: speakerNames[speaker] ?? null, corrected: corrections[i] !== undefined };
+    // A manual name for this call's local speaker id always wins; otherwise
+    // fall back to the cross-call voice-fingerprint match (see
+    // speakerEmbed.js) if one was found, flagged as auto so the UI can show
+    // it's a guess rather than something you confirmed.
+    const manualName = speakerNames[speaker] ?? null;
+    const speakerName = manualName ?? seg.voiceMatch?.name ?? null;
+    return {
+      ...seg,
+      index: i,
+      speaker,
+      speakerName,
+      autoMatched: !manualName && !!seg.voiceMatch,
+      voiceMatchScore: seg.voiceMatch?.score ?? null,
+      corrected: corrections[i] !== undefined,
+    };
   });
   return { sourceFile, callDate: transcript.callDate, segments, speakerNames };
 }
@@ -75,6 +104,112 @@ function cosineSim(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
   return dot;
+}
+
+// Named speakers are only ever local slot-ids per recording (see
+// diarize.js) unless a voice-fingerprint match already resolved one to a
+// cross-call name. Naming a speaker in the viewer both labels this
+// recording AND enrolls/updates a GLOBAL voice profile (results/voiceProfiles.json,
+// separate from any one recording's files) from that speaker's own
+// voiceEmbeddings, so the NEXT recording ingested can recognize the same
+// voice automatically. Merged as a running average, not overwritten, so
+// one bad clip doesn't wreck an otherwise-good profile.
+function updateVoiceProfiles(sourceFile, names) {
+  const transcript = readJSON(path.join(RESULTS_DIR, `${sourceFile}.transcript.json`), null);
+  if (!transcript) return;
+  const corrections = readJSON(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), {});
+  const profilesPath = path.join(RESULTS_DIR, 'voiceProfiles.json');
+  const profiles = readJSON(profilesPath, {});
+
+  const embeddingsBySpeaker = {};
+  transcript.segments.forEach((seg, i) => {
+    const speaker = corrections[i] !== undefined ? corrections[i] : seg.speaker;
+    if (speaker == null || !seg.voiceEmbedding) return;
+    (embeddingsBySpeaker[speaker] ??= []).push(seg.voiceEmbedding);
+  });
+
+  for (const [speakerId, name] of Object.entries(names)) {
+    const embeddings = embeddingsBySpeaker[speakerId];
+    if (!embeddings || embeddings.length === 0) continue;
+    const dims = embeddings[0].length;
+    const sum = new Array(dims).fill(0);
+    for (const e of embeddings) for (let d = 0; d < dims; d++) sum[d] += e[d];
+
+    const existing = profiles[name];
+    const newCount = embeddings.length;
+    if (existing) {
+      const total = existing.count + newCount;
+      profiles[name] = {
+        embedding: existing.embedding.map((v, d) => (v * existing.count + sum[d]) / total),
+        count: total,
+      };
+    } else {
+      profiles[name] = { embedding: sum.map((v) => v / newCount), count: newCount };
+    }
+  }
+
+  fs.writeFileSync(profilesPath, JSON.stringify(profiles, null, 2));
+}
+
+// Every segment, across every recording, that doesn't yet have a confirmed
+// name and isn't long enough into a confident voice-fingerprint match --
+// i.e. worth showing a human. The viewer filters this list by confidence
+// client-side (no threshold param here) so adjusting the slider doesn't
+// need a round trip. Segments already manually named (via corrections ->
+// speakerNames) are excluded entirely -- once you've answered a clip, it's
+// answered, low-confidence match or not.
+function listReviewCandidates() {
+  if (!fs.existsSync(RESULTS_DIR)) return [];
+  const files = fs.readdirSync(RESULTS_DIR).filter((f) => f.endsWith('.transcript.json'));
+  const out = [];
+  for (const f of files) {
+    const sourceFile = f.replace(/\.transcript\.json$/, '');
+    const transcript = readJSON(path.join(RESULTS_DIR, f), { segments: [] });
+    const speakerNames = readJSON(path.join(RESULTS_DIR, `${sourceFile}.speakers.json`), {});
+    const corrections = readJSON(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), {});
+    transcript.segments.forEach((seg, i) => {
+      const speaker = corrections[i] !== undefined ? corrections[i] : seg.speaker;
+      const manualName = speakerNames[speaker] ?? null;
+      if (manualName) return; // already confirmed, not a review candidate
+      out.push({
+        sourceFile,
+        callDate: transcript.callDate,
+        index: i,
+        start: seg.start,
+        end: seg.end,
+        text: seg.text,
+        speaker,
+        voiceMatchName: seg.voiceMatch?.name ?? null,
+        voiceMatchScore: seg.voiceMatch?.score ?? null,
+      });
+    });
+  }
+  // Most uncertain first: no match at all, then lowest-confidence matches
+  return out.sort((a, b) => (a.voiceMatchScore ?? -1) - (b.voiceMatchScore ?? -1));
+}
+
+// Answering one review clip: assign it a fresh local speaker id in its own
+// recording (so it doesn't drag along whatever else that recording's
+// diarization happened to lump into the same slot) via the existing
+// corrections mechanism, then name that id via the existing speakers
+// mechanism -- which also enrolls/updates the global voice profile. Reuses
+// both existing endpoints' logic rather than inventing a third data path.
+function answerReviewCandidate(sourceFile, segmentIndex, name) {
+  const corrections = readJSON(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), {});
+  const speakerNames = readJSON(path.join(RESULTS_DIR, `${sourceFile}.speakers.json`), {});
+  const transcript = readJSON(path.join(RESULTS_DIR, `${sourceFile}.transcript.json`), null);
+  if (!transcript) throw new Error(`no such recording: ${sourceFile}`);
+
+  const allIds = transcript.segments.map((s, i) => (corrections[i] !== undefined ? corrections[i] : s.speaker));
+  const newId = Math.max(-1, ...allIds.map(Number).filter((n) => !Number.isNaN(n))) + 1;
+
+  corrections[segmentIndex] = newId;
+  speakerNames[newId] = name;
+
+  fs.mkdirSync(RESULTS_DIR, { recursive: true });
+  fs.writeFileSync(path.join(RESULTS_DIR, `${sourceFile}.corrections.json`), JSON.stringify(corrections, null, 2));
+  fs.writeFileSync(path.join(RESULTS_DIR, `${sourceFile}.speakers.json`), JSON.stringify(speakerNames, null, 2));
+  updateVoiceProfiles(sourceFile, { [newId]: name });
 }
 
 let embedQueryFn = null;
@@ -109,7 +244,7 @@ function loadAllSegmentsForQuery() {
         end: seg.end,
         text: seg.text,
         speaker,
-        speakerName: speakerNames[speaker] ?? null,
+        speakerName: speakerNames[speaker] ?? seg.voiceMatch?.name ?? null,
         embedding: seg.embedding,
       });
     });
@@ -237,6 +372,32 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, listRecordings());
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/voices') {
+      const profiles = readJSON(path.join(RESULTS_DIR, 'voiceProfiles.json'), {});
+      return sendJSON(
+        res,
+        200,
+        Object.entries(profiles).map(([name, p]) => ({ name, clipsEnrolled: p.count })),
+      );
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/review') {
+      return sendJSON(res, 200, listReviewCandidates());
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/review/answer') {
+      const { sourceFile, segmentIndex, name } = await readBody(req);
+      if (!sourceFile || segmentIndex == null || !name) {
+        return sendJSON(res, 400, { error: 'sourceFile, segmentIndex, and name are required' });
+      }
+      try {
+        answerReviewCandidate(sourceFile, segmentIndex, name);
+      } catch (err) {
+        return sendJSON(res, 404, { error: err.message });
+      }
+      return sendJSON(res, 200, { ok: true });
+    }
+
     let m;
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/recordings\/(.+)$/))) {
       const rec = getRecording(decodeURIComponent(m[1]));
@@ -252,6 +413,7 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req);
       fs.mkdirSync(RESULTS_DIR, { recursive: true });
       fs.writeFileSync(path.join(RESULTS_DIR, `${sourceFile}.speakers.json`), JSON.stringify(body, null, 2));
+      updateVoiceProfiles(sourceFile, body);
       return sendJSON(res, 200, { ok: true });
     }
 

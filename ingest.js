@@ -1,9 +1,7 @@
 // Batch ingest: point at a directory of mp3 call recordings, transcribe +
 // embed every one that hasn't been processed yet. One DCP job, one slice
 // per file, each slice running the full decode->VAD->transcribe->embed
-// pipeline -- lets DCP parallelize whole-file pipelines across workers
-// instead of forcing every file through transcription before any file can
-// start embedding (the cost of the old two-job design).
+// pipeline -- DCP parallelize whole-file pipelines across workers
 //
 // Usage: node ingest.js <directory-of-mp3s>
 async function main() {
@@ -26,6 +24,14 @@ async function main() {
 
   const resultsDir = `${__dirname}/results`;
   fs.mkdirSync(resultsDir, { recursive: true });
+
+  function readJSON(p, fallback) {
+    try {
+      return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch {
+      return fallback;
+    }
+  }
 
   function persist(r) {
     if (!r.sourceFile) return; // an error result with no sourceFile -- nothing to write
@@ -58,7 +64,7 @@ async function main() {
     sourceFile: f,
   }));
 
-  async function pipelineWork(unit, whisperModelFiles, bgeModelFiles, pyannoteModelFiles) {
+  async function pipelineWork(unit, whisperModelFiles, bgeModelFiles, pyannoteModelFiles, wavlmModelFiles, voiceProfiles) {
     progress(0);
     const base64 = require('./base64');
     const decodeMp3 = require('./decodeMp3');
@@ -68,6 +74,8 @@ async function main() {
     const embedText = require('./embedText');
     const diarize = require('./diarize');
     const { assignSpeakers } = diarize;
+    const speakerEmbed = require('./speakerEmbed');
+    const { matchVoice } = speakerEmbed;
 
     const TARGET_SR = 16000; // what both Whisper and pyannote-segmentation expect
 
@@ -108,21 +116,49 @@ async function main() {
     timings.diarize = Date.now() - t0 - timings.decodeAndResample;
     progress(0.2);
 
+    // Voice-fingerprint each diarization turn and match it against known,
+    // named voice profiles (built up via the viewer -- see server.js).
+    // diarize.js's turn IDs are only consistent within THIS call; matching
+    // against a voice embedding is what makes a name carry across calls.
+    // Turns too short to embed reliably (see speakerEmbed.js) just don't
+    // get a voice match -- they keep their local speaker id only.
+    const turnsWithVoice = [];
+    for (let i = 0; i < turns.length; i++) {
+      const turn = turns[i];
+      const startSample = Math.round(turn.start * TARGET_SR);
+      const endSample = Math.round(turn.end * TARGET_SR);
+      const voiceEmbedding = await speakerEmbed(resampled.subarray(startSample, endSample), wavlmModelFiles);
+      const voiceMatch = voiceEmbedding ? matchVoice(voiceEmbedding, voiceProfiles) : null;
+      turnsWithVoice.push({ ...turn, voiceEmbedding, voiceMatch });
+      progress(0.2 + 0.05 * ((i + 1) / turns.length)); // a real recording can have hundreds of turns -- same ENOPROGRESS risk as diarize()/transcribeAudio()
+    }
+    timings.speakerEmbed = Date.now() - t0 - timings.decodeAndResample - timings.diarize;
+
     const regions = detectSpeechRegions(resampled, TARGET_SR);
     const { trimmed, mapping } = trimToSpeech(resampled, TARGET_SR, regions);
-    timings.vad = Date.now() - t0 - timings.decodeAndResample - timings.diarize;
+    timings.vad = Date.now() - t0 - timings.decodeAndResample - timings.diarize - timings.speakerEmbed;
     progress(0.3);
 
-    const rawSegments = await transcribeAudio(trimmed, whisperModelFiles, 'uint8', 'Xenova/whisper-base.en', () =>
-      progress(0.4),
-    );
-    timings.transcribe = Date.now() - t0 - timings.decodeAndResample - timings.diarize - timings.vad;
+    // Whisper's token-level callback has no way to know how many tokens are
+    // left (unlike diarize's/speakerEmbed's chunk loops above, which know
+    // their total up front) -- a fixed progress(0.4) here just repeats the
+    // same percentage for the whole transcription stage, which is alive
+    // enough to dodge ENOPROGRESS but LOOKS identical to a frozen worker to
+    // anyone watching. Climb asymptotically toward (not reaching) 0.5
+    // instead, so it visibly moves without ever overshooting into the next
+    // stage's range before transcription actually finishes.
+    let transcribeTokens = 0;
+    const rawSegments = await transcribeAudio(trimmed, whisperModelFiles, 'uint8', 'Xenova/whisper-base.en', () => {
+      transcribeTokens++;
+      progress(0.4 + 0.1 * (1 - 1 / (1 + transcribeTokens / 200)));
+    });
+    timings.transcribe = Date.now() - t0 - timings.decodeAndResample - timings.diarize - timings.speakerEmbed - timings.vad;
     const withTime = rawSegments.map((s) => ({
       start: remapTime(s.start, mapping),
       end: remapTime(s.end, mapping),
       text: s.text,
     }));
-    const segments = assignSpeakers(withTime, turns);
+    const segments = assignSpeakers(withTime, turnsWithVoice);
     progress(0.5);
 
     // Transcription is the expensive, slow-to-redo half -- guarantee it's
@@ -147,7 +183,7 @@ async function main() {
       embedded = undefined;
       embedError = err.message;
     }
-    timings.embed = Date.now() - t0 - timings.decodeAndResample - timings.diarize - timings.vad - timings.transcribe;
+    timings.embed = Date.now() - t0 - timings.decodeAndResample - timings.diarize - timings.speakerEmbed - timings.vad - timings.transcribe;
     timings.totalMs = Date.now() - t0;
     console.log(`timings (ms) for ${unit.sourceFile}:`, JSON.stringify(timings));
 
@@ -162,8 +198,13 @@ async function main() {
   const whisperModelFiles = require('./whisperBaseEnModelFilesBase64');
   const bgeModelFiles = require('./bgeSmallModelFilesBase64');
   const pyannoteModelFiles = require('./pyannoteModelFilesBase64'); // tiny (~7.6MB); shipped as a job argument for consistency with the other two models, though job.requires() would work fine at this size too
-  const job = compute.for(inputSet, pipelineWork, [whisperModelFiles, bgeModelFiles, pyannoteModelFiles]);
-  job.requires(['./base64', './decodeMp3', './resample', './vad', './transcribeAudio', './embedText', './diarize']);
+  const wavlmModelFiles = require('./wavlmModelFilesBase64'); // ~129MB -- job argument, well past the job.requires() ceiling
+  // Known named voices, built up via the viewer's speaker-naming endpoint
+  // (see server.js) -- passed in fresh on every dispatch so newly-named
+  // speakers get recognized on the NEXT file processed, not retroactively.
+  const voiceProfiles = readJSON(`${resultsDir}/voiceProfiles.json`, {});
+  const job = compute.for(inputSet, pipelineWork, [whisperModelFiles, bgeModelFiles, pyannoteModelFiles, wavlmModelFiles, voiceProfiles]);
+  job.requires(['./base64', './decodeMp3', './resample', './vad', './transcribeAudio', './embedText', './diarize', './speakerEmbed']);
   job.computeGroups = [{ joinKey: 'ibm', joinSecret: 'dcp' }];
   job.requirements = job.requirements || {};
   job.requirements.environment = { webgpu: true };

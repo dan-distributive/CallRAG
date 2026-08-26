@@ -79,15 +79,27 @@ async function diarize(samples, modelFiles, onChunk) {
  * covers its midpoint. `turns` and `segments` must be on the same timeline
  * (both original-recording time, not VAD-trimmed time) -- diarize() should
  * always be run on the full untrimmed audio for exactly this reason.
+ *
+ * If `turns` came from ingest.js's voice-fingerprint step (each turn
+ * carrying `voiceMatch`/`voiceEmbedding` from speakerEmbed.js), those are
+ * copied through too -- `speaker` is the local per-call slot id (see the
+ * module doc above), `voiceMatch` is a cross-call name match if one was
+ * found, and `voiceEmbedding` lets the viewer enroll/update a voice
+ * profile later even for segments that didn't match anything yet.
  * @param {Array<{start: number, end: number}>} segments
- * @param {Array<{ id: number, start: number, end: number }>} turns
- * @returns {Array} segments with a `speaker` field added (null if no turn covers it)
+ * @param {Array<{ id: number, start: number, end: number, voiceMatch?: {name: string, score: number}|null, voiceEmbedding?: number[]|null }>} turns
+ * @returns {Array} segments with `speaker`/`voiceMatch`/`voiceEmbedding` fields added (null if no turn covers it)
  */
 function assignSpeakers(segments, turns) {
   return segments.map((seg) => {
     const mid = (seg.start + seg.end) / 2;
     const turn = turns.find((t) => mid >= t.start && mid < t.end);
-    return { ...seg, speaker: turn ? turn.id : null };
+    return {
+      ...seg,
+      speaker: turn ? turn.id : null,
+      voiceMatch: turn?.voiceMatch ?? null,
+      voiceEmbedding: turn?.voiceEmbedding ?? null,
+    };
   });
 }
 

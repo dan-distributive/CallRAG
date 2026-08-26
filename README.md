@@ -14,7 +14,7 @@ session) doesn't have to rediscover them.
 
 ```
 npm install
-node scripts/prepare-models.js   # downloads + embeds the models below (~185MB of local cache; one-time)
+node scripts/prepare-models.js   # downloads + embeds the models below (~314MB of local cache; one-time)
 ```
 
 You'll also need a DCP identity/wallet — see `dcp-client`'s own docs if you
@@ -40,9 +40,10 @@ mp3 file
   -> decode (minimp3-wasm)              8kHz-or-whatever mono PCM
   -> resample to 16kHz                  (required -- see Gotcha 9)
   -> diarize (pyannote-segmentation-3.0) speaker turns, chunked 30s windows
+  -> voice-fingerprint each turn (wavlm) 512-dim embeddings, matched against known named voices
   -> VAD (pure JS energy-based)          trims silence before transcription
   -> transcribe (Whisper base.en)        segments with text + timestamps
-  -> assign speakers                     match each segment to a diarization turn
+  -> assign speakers                     match each segment to a diarization turn (+ voice match, if any)
   -> embed each segment (bge-small)      384-dim vectors for retrieval
   -> persist to results/*.json           one file per recording, per stage
 ```
@@ -60,7 +61,7 @@ that dispatch overhead isn't worth it.
 | | | | whisper-medium.en | ~740MB | | |
 | Diarization | `onnx-community/pyannote-segmentation-3.0` (fp32) | 7.6MB | *(no bigger segmentation variant — better diarization means adding a speaker-embedding model, not a bigger segmentation model)* | | int8/quantized | ~1.5MB |
 | Text embedding | `Xenova/bge-small-en-v1.5` (q8) | ~46MB | bge-base-en-v1.5 | ~105MB | all-MiniLM-L6-v2 | ~22MB |
-| *(not built)* Speaker identity | — | — | `Xenova/wavlm-base-sv` (speaker verification) | ~97MB (quantized) | — | — |
+| Speaker identity | `Xenova/wavlm-base-plus-sv` (q8) | ~129MB | — (fp32, ~384MB) | ~384MB | — | — |
 
 Swapping any of these is mechanically cheap — `dtype` and `modelName` are
 already parameters on `transcribeAudio()`/`embedText()`, and every model
@@ -75,9 +76,9 @@ picks up a slice, split across two transports (see Gotcha 3):
 
 | Transport | Contents | Size |
 |---|---|---|
-| `job.requires()` (webpack-bundled locally, then shipped) | `base64.js`, `decodeMp3.js` + `decoderWasmBase64.js`, `resample.js`, `vad.js`, `transcribeAudio.js`, `embedText.js`, `diarize.js`, `setupOrt.js` + **`ortWasmAsyncifyBase64.js`**, `modelFetchPatch.js`, `polyfills.js` | **~30.0MB** (almost entirely the onnxruntime-web wasm binary) |
-| Job arguments (kvin-serialized, not bundled) | whisper-base.en model files, bge-small model files, pyannote-segmentation model files | **~152.2MB** (~100.4MB + ~46.3MB + ~7.6MB) |
-| **Total per slice** | | **~182.2MB** |
+| `job.requires()` (webpack-bundled locally, then shipped) | `base64.js`, `decodeMp3.js` + `decoderWasmBase64.js`, `resample.js`, `vad.js`, `transcribeAudio.js`, `embedText.js`, `diarize.js`, `speakerEmbed.js`, `setupOrt.js` + **`ortWasmAsyncifyBase64.js`**, `modelFetchPatch.js`, `polyfills.js` | **~30.0MB** (almost entirely the onnxruntime-web wasm binary) |
+| Job arguments (kvin-serialized, not bundled) | whisper-base.en, bge-small, pyannote-segmentation, wavlm-base-plus-sv model files + known voice profiles | **~281.6MB** (~100.4MB + ~44.2MB + ~7.6MB + ~129.4MB) |
+| **Total per slice** | | **~311.6MB** |
 
 That's a lot of data re-sent per file. It's not currently cached
 worker-side across slices of the same job (each slice is an independent
@@ -211,19 +212,49 @@ gets slow on the dispatch/upload side rather than the compute side.
     the *only* working transport for binary data through DCP's job
     dispatch or remote-data-fetch paths.
 
+14. **A "keep-alive" progress callback with a fixed value defeats its own
+    purpose.** Whisper's per-token `streamer` callback (added for Gotcha
+    11's `ENOPROGRESS` fix) initially called `progress(0.4)` on every
+    token — technically satisfies the scheduler's liveness requirement, but
+    to anyone watching the portal, a percentage that repeats exactly for
+    minutes looks identical to a genuinely frozen worker (indistinguishable
+    without checking timestamps). Fixed by climbing asymptotically toward
+    the next real milestone as tokens accumulate, since the total token
+    count isn't knowable in advance the way diarization's/speaker-embedding's
+    chunk counts are.
+
+## Speaker identity (voice-fingerprint matching)
+
+`pyannote-segmentation-3.0` alone only answers "when did the speaker
+change" with local per-call slot IDs — "speaker 2" in one call is not the
+same physical person as "speaker 2" in another. `speakerEmbed.js` adds the
+other half: a `Xenova/wavlm-base-plus-sv` voice-fingerprint embedding per
+diarization turn, matched (cosine similarity) against a store of
+known, *named* voices (`results/voiceProfiles.json`, built up via the
+viewer, keyed by name and shared across every recording).
+
+Naming a speaker anywhere in the viewer (the main panel's legend, or the
+dedicated **Needs Review** panel — a cross-recording queue of every
+unmatched or low-confidence clip, with an adjustable confidence slider and
+inline audio playback) enrolls or updates that name's profile as a running
+average from that speaker's own embeddings. Every subsequent `ingest.js`
+run loads the current profile store fresh and passes it into the worker,
+so **later recordings recognize the same voice automatically** — validated
+end to end, not just built: enrolling one clip as a name, then re-ingesting
+a different recording of the same speaker from scratch, produced
+0.89–1.00 confidence auto-matches on every segment with zero manual input.
+
+This only applies going forward: recordings ingested before this feature
+existed have no `voiceEmbedding` data to enroll from, so folding older
+files into voice-based recognition means re-ingesting them.
+
 ## Known limitations
 
-- **Diarization is per-call only, not per-speaker-identity.**
-  `pyannote-segmentation-3.0` labels local speaker *slots* within one
-  continuous audio buffer — "speaker 2" in one call is not guaranteed to
-  be the same physical person as "speaker 2" in a different call (or even
-  reliably the same person across a very long single call, since it's
-  chunked). No enrollment/identity-matching exists. The viewer's
-  correction/naming UI overrides labels for display and query purposes,
-  permanently, per recording — but that's a display-layer fix, not the
-  model getting more accurate. A real fix would add a speaker-embedding
-  model (see table above) and match by voice-fingerprint similarity
-  instead of relying on segmentation slot IDs.
+- **Voice matching is per-named-profile, not perfect identity resolution.**
+  It's cosine-similarity matching against whatever's been enrolled — two
+  similar-sounding voices can cross-match, and a voice with very little
+  enrolled audio matches less reliably. The Needs Review panel's confidence
+  threshold is there specifically to catch and correct this.
 - **No true waveform visualization** — the viewer's timeline shows
   diarization turns as colored blocks, not actual audio amplitude.
 - **The "vector store" is flat JSON files, one per recording per stage** —
@@ -235,7 +266,7 @@ gets slow on the dispatch/upload side rather than the compute side.
   whisper-base.en upgrade and the sample-rate fix, but Whisper's
   repetition-loop failure mode on quiet/low-confidence audio hasn't been
   eliminated, only reduced.
-- **~182MB re-shipped per worker per file** (see payload table above) —
+- **~312MB re-shipped per worker per file** (see payload table above) —
   no cross-slice model caching exists yet.
 
 ## File reference
@@ -243,12 +274,13 @@ gets slow on the dispatch/upload side rather than the compute side.
 - `ingest.js` — the main entry point: batch transcribe+diarize+embed a
   directory of mp3s via one DCP job.
 - `query.js` / `server.js` — local retrieval + LLM synthesis (no DCP
-  dispatch); `server.js` also backs the `viewer.html` UI.
+  dispatch); `server.js` also backs the `viewer.html` UI, including the
+  Needs Review / voice-enrollment endpoints.
 - `decodeMp3.js`, `resample.js`, `vad.js`, `transcribeAudio.js`,
-  `embedText.js`, `diarize.js` — independently-reusable pipeline stage
-  modules, each taking model files as a parameter rather than importing
-  them, so any module can ship via `job.requires()`, a job argument, or a
-  published package without the others knowing.
+  `embedText.js`, `diarize.js`, `speakerEmbed.js` — independently-reusable
+  pipeline stage modules, each taking model files as a parameter rather
+  than importing them, so any module can ship via `job.requires()`, a job
+  argument, or a published package without the others knowing.
 - `modelFetchPatch.js`, `setupOrt.js`, `polyfills.js`, `base64.js`,
   `callDate.js` — shared DCP-sandbox-compatibility shims and small utilities
   (see Gotchas 2, 4, 9 in spirit).

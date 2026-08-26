@@ -148,6 +148,14 @@
     border-top: 1px solid var(--border-soft);
   }
   .stats b { color: var(--text-muted); font-weight: 600; }
+  .reviewRow { padding: 12px 0; border-top: 1px solid var(--border-soft); font-size: 13px; }
+  .reviewRow:first-child { border-top: none; }
+  .reviewRow .meta { color: var(--text-faint); font-size: 11px; margin-bottom: 4px; }
+  .reviewRow .text { line-height: 1.5; margin-bottom: 8px; }
+  .reviewRow .controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .reviewRow audio { width: 220px; height: 28px; margin: 0; }
+  .reviewRow input[list] { width: 160px; }
+  #reviewList .empty { color: var(--text-faint); font-size: 13px; padding: 8px 0; }
   #answer {
     white-space: pre-wrap;
     background: var(--accent-soft);
@@ -171,6 +179,11 @@
   <select id="recordingSelect"></select>
 </div>
 
+<div class="panel">
+  <h2>Known voices</h2>
+  <div id="knownVoices" style="font-size:13px; color:var(--text-muted)">loading…</div>
+</div>
+
 <div class="panel" id="playerPanel" style="display:none">
   <h2>Diarization &amp; playback</h2>
   <div id="timeline"><div id="playhead"></div></div>
@@ -180,6 +193,17 @@
 
   <h2 style="margin-top:24px">Transcript</h2>
   <div id="transcript"></div>
+</div>
+
+<div class="panel">
+  <h2>Needs review</h2>
+  <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px">
+    <label style="font-size:12px; color:var(--text-muted)">show clips below confidence</label>
+    <input type="range" id="reviewThreshold" min="0" max="100" value="70" style="width:120px">
+    <span id="reviewThresholdLabel" style="font-size:12px; color:var(--text-muted); width:34px">70%</span>
+    <span id="reviewCount" style="font-size:12px; color:var(--text-faint); margin-left:auto"></span>
+  </div>
+  <div id="reviewList"></div>
 </div>
 
 <div class="panel">
@@ -206,6 +230,87 @@ function colorFor(speakerId) {
 let current = null; // {sourceFile, callDate, segments, speakerNames}
 let audioEl = document.getElementById('audioEl');
 
+async function loadKnownVoices() {
+  const voices = await fetch('/api/voices').then(r => r.json());
+  knownVoiceNames = voices.map(v => v.name);
+  const el = document.getElementById('knownVoices');
+  el.innerHTML = voices.length
+    ? voices.map(v => `<span style="margin-right:16px"><b style="color:var(--text)">${v.name}</b> · ${v.clipsEnrolled} clip${v.clipsEnrolled === 1 ? '' : 's'}</span>`).join('')
+    : 'None yet -- name a speaker below to enroll their voice.';
+}
+
+let reviewCandidates = [];
+let knownVoiceNames = [];
+
+async function loadReviewQueue() {
+  reviewCandidates = await fetch('/api/review').then(r => r.json());
+  renderReviewQueue();
+}
+
+function renderReviewQueue() {
+  const threshold = Number(document.getElementById('reviewThreshold').value) / 100;
+  document.getElementById('reviewThresholdLabel').textContent = Math.round(threshold * 100) + '%';
+
+  // A candidate is worth showing if it has no match at all, or its match
+  // confidence is below the slider. Raising the slider surfaces more (even
+  // fairly-confident) clips for you to double-check; lowering it narrows
+  // down to only the clips the voice-matching genuinely couldn't place.
+  const visible = reviewCandidates.filter(c => c.voiceMatchScore == null || c.voiceMatchScore < threshold);
+  document.getElementById('reviewCount').textContent = `${visible.length} of ${reviewCandidates.length} clips`;
+
+  const listEl = document.getElementById('reviewList');
+  if (visible.length === 0) {
+    listEl.innerHTML = '<div class="empty">Nothing to review at this confidence level.</div>';
+    return;
+  }
+
+  const datalistOptions = knownVoiceNames.map(n => `<option value="${n}">`).join('');
+  listEl.innerHTML = `<datalist id="knownVoiceNames">${datalistOptions}</datalist>` + visible.slice(0, 30).map((c, i) => {
+    const when = c.callDate ? c.callDate.slice(0,10) : 'no date';
+    const guess = c.voiceMatchName ? `best guess: ${c.voiceMatchName} (${(c.voiceMatchScore*100).toFixed(0)}%)` : 'no voice match';
+    return `
+      <div class="reviewRow" data-source="${c.sourceFile}" data-index="${c.index}">
+        <div class="meta">${c.sourceFile} (${when}) @ ${c.start.toFixed(1)}s -- ${guess}</div>
+        <div class="text">${c.text}</div>
+        <div class="controls">
+          <audio controls preload="none" src="/audio/${encodeURIComponent(c.sourceFile)}#t=${c.start.toFixed(1)}"></audio>
+          <input type="text" list="knownVoiceNames" placeholder="who is this?" value="${c.voiceMatchName ?? ''}">
+          <button class="primary reviewSubmit">Confirm</button>
+          <button class="reviewSkip">Skip</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  listEl.querySelectorAll('.reviewRow').forEach(row => {
+    row.querySelector('.reviewSubmit').addEventListener('click', () => submitReview(row));
+    row.querySelector('.reviewSkip').addEventListener('click', () => row.remove());
+    row.querySelector('input[type=text]').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') submitReview(row);
+    });
+  });
+}
+
+async function submitReview(row) {
+  const name = row.querySelector('input[type=text]').value.trim();
+  if (!name) return;
+  const sourceFile = row.dataset.source;
+  const segmentIndex = Number(row.dataset.index);
+  await fetch('/api/review/answer', {
+    method: 'POST', headers: {'content-type':'application/json'},
+    body: JSON.stringify({ sourceFile, segmentIndex, name })
+  });
+  reviewCandidates = reviewCandidates.filter(c => !(c.sourceFile === sourceFile && c.index === segmentIndex));
+  row.remove();
+  document.getElementById('reviewCount').textContent = `${document.querySelectorAll('.reviewRow').length} of ${reviewCandidates.length} clips`;
+  loadKnownVoices();
+  loadReviewQueue();
+  // If the currently-open recording is the one just answered, refresh it
+  // so the transcript/legend reflect the new name immediately.
+  if (current && current.sourceFile === sourceFile) loadRecording(sourceFile);
+}
+
+document.getElementById('reviewThreshold').addEventListener('input', renderReviewQueue);
+
 async function loadRecordingList() {
   const recordings = await fetch('/api/recordings').then(r => r.json());
   const sel = document.getElementById('recordingSelect');
@@ -229,6 +334,16 @@ function uniqueSpeakers() {
   return Array.from(ids).sort((a,b) => a - b);
 }
 
+// A short label for a local speaker id: the manually-confirmed name if one
+// was saved, else a cross-call voice-fingerprint guess (marked "auto" with
+// its match confidence -- see speakerEmbed.js), else just the raw slot id.
+function speakerLabel(id) {
+  if (current.speakerNames[id]) return current.speakerNames[id];
+  const seg = current.segments.find(s => s.speaker === id && s.autoMatched);
+  if (seg) return `${seg.speakerName} (auto ${(seg.voiceMatchScore * 100).toFixed(0)}%)`;
+  return 'speaker ' + id;
+}
+
 function renderTimeline() {
   const el = document.getElementById('timeline');
   el.querySelectorAll('.turn').forEach(n => n.remove());
@@ -239,7 +354,7 @@ function renderTimeline() {
     div.style.left = (seg.start / total * 100) + '%';
     div.style.width = Math.max(0.3, (seg.end - seg.start) / total * 100) + '%';
     div.style.background = colorFor(seg.speaker);
-    div.title = `${seg.speakerName ?? 'speaker ' + seg.speaker} @ ${seg.start.toFixed(1)}s: ${seg.text.slice(0,60)}`;
+    div.title = `${speakerLabel(seg.speaker)} @ ${seg.start.toFixed(1)}s: ${seg.text.slice(0,60)}`;
     div.addEventListener('click', () => { audioEl.currentTime = seg.start; audioEl.play(); });
     el.appendChild(div);
   }
@@ -251,7 +366,9 @@ function renderLegend() {
   for (const id of uniqueSpeakers()) {
     const item = document.createElement('div');
     item.className = 'legend-item';
-    item.innerHTML = `<span class="swatch" style="background:${colorFor(id)}"></span> speaker ${id}
+    const auto = !current.speakerNames[id] && current.segments.find(s => s.speaker === id && s.autoMatched);
+    const hint = auto ? ` title="voice-matched, ${(auto.voiceMatchScore*100).toFixed(0)}% confidence -- not yet confirmed"` : '';
+    item.innerHTML = `<span class="swatch" style="background:${colorFor(id)}"${hint}></span> ${speakerLabel(id)}
       <input type="text" data-speaker="${id}" placeholder="name..." value="${current.speakerNames[id] ?? ''}">`;
     el.appendChild(item);
   }
@@ -275,7 +392,7 @@ function renderTranscript() {
     const speakerTag = document.createElement('select');
     speakerTag.className = 'speaker-tag';
     speakerTag.innerHTML = speakerOptions.map(id =>
-      `<option value="${id}" ${id === seg.speaker ? 'selected' : ''}>${current.speakerNames[id] ?? ('spk ' + id)}</option>`
+      `<option value="${id}" ${id === seg.speaker ? 'selected' : ''}>${speakerLabel(id)}</option>`
     ).join('') + `<option value="__new__">+ new speaker</option>`;
     speakerTag.addEventListener('click', (e) => e.stopPropagation());
     speakerTag.addEventListener('change', () => onCorrect(seg.index, speakerTag));
@@ -327,6 +444,8 @@ document.getElementById('saveNamesBtn').addEventListener('click', async () => {
   renderLegend();
   renderTranscript();
   renderTimeline();
+  loadKnownVoices();
+  loadReviewQueue();
 });
 
 document.getElementById('recordingSelect').addEventListener('change', (e) => loadRecording(e.target.value));
@@ -394,6 +513,7 @@ document.getElementById('askBtn').addEventListener('click', async () => {
 });
 
 loadRecordingList();
+loadKnownVoices().then(loadReviewQueue); // sequenced so the review list's autocomplete has known-voice names on first render
 </script>
 </body>
 </html>
