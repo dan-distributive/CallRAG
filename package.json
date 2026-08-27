@@ -4,6 +4,7 @@
   "description": "mp3 call recordings -> searchable, LLM-queryable knowledge, via DCP-dispatched transcription/diarization/embedding + local retrieval",
   "main": "ingest.js",
   "scripts": {
+    "postinstall": "node scripts/patch-deps.js",
     "prepare-models": "node scripts/prepare-models.js",
     "ingest": "node ingest.js",
     "query": "node query.js",

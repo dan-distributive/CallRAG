@@ -13,7 +13,7 @@ session) doesn't have to rediscover them.
 ## Setup
 
 ```
-npm install
+npm install   # also runs scripts/patch-deps.js (postinstall) -- fixes a WebGPU self-location crash, see Gotcha 16
 node scripts/prepare-models.js         # downloads + embeds the models below (~314MB of local cache; one-time)
 node scripts/build-model-packages.js   # wraps them for publishing (see "Published package" below)
 node scripts/publish-model-packages.js # publishes to the DCP package manager (one-time, or after a version bump)
@@ -258,17 +258,28 @@ that broke down and what replaced it.
     entirely (commented out, not deleted, in case a real future WebGPU
     attempt wants it back).
 
-16. **WebGPU's real crash root cause, found and fixed** — Gotcha 6's
-    "uncatchable" crash turned out to be onnxruntime-web's WebGPU (JSEP)
-    backend doing a genuine dynamic `import()` of a relative companion
-    `.mjs` file during session init, which can never resolve under DCP's
-    sandboxed `eval` (base URL is `about:blank`). Fixed by setting
-    `env.backends.onnx.wasm.wasmPaths.mjs` to a `data:` URL (needs no base
-    URL to resolve) in `setupOrt.js` — confirmed via a real dispatch:
+16. **WebGPU's real crash root cause, found and fixed — two separate bugs,
+    both needed fixing.** Gotcha 6's "uncatchable" crash turned out to be
+    onnxruntime-web's WebGPU (JSEP) backend doing a genuine dynamic
+    `import()` of a relative companion `.mjs` file during session init,
+    which can never resolve under DCP's sandboxed `eval` (base URL is
+    `about:blank`). Fixed by setting `env.backends.onnx.wasm.wasmPaths.mjs`
+    to a `data:` URL (needs no base URL to resolve) in `setupOrt.js`. A
+    **second, separate** self-location crash sits earlier in the same
+    loading sequence, at the library's own top-level entry point
+    (`onnxruntime-web/webgpu`'s `package.json` `exports` map resolves
+    straight to `dist/ort.webgpu.{min.js,min.mjs,bundle.min.mjs}`) — it
+    fires at module init, before `setupOrt.js`'s configuration code even
+    runs, and has no configuration escape hatch. Fixed by patching those
+    three minified files directly (`scripts/patch-deps.js`, wired into
+    `npm install` via `postinstall` — see Setup above) to no-op the
+    self-location lookup. Both fixes are required together; either one
+    alone still crashes. Confirmed via a real dispatch with both in place:
     Whisper loaded and ran inference on `device: 'webgpu'` end to end. Full
     escalation-ladder writeup (bare WebGPU → raw onnxruntime-web → full
-    transformers.js pipeline, each rung a real DCP dispatch): docs.dcp.dev's
-    "Getting WebGPU-accelerated libraries working in DCP work functions."
+    transformers.js pipeline, each rung a real DCP dispatch), plus the
+    second crash site's details: docs.dcp.dev's "Getting WebGPU-accelerated
+    libraries working in DCP work functions."
 
 17. **`gpuFallback.js` tries `device: 'webgpu'` first on every model load,
     falling back to `device: 'wasm'` on any failure** (all four
@@ -416,3 +427,6 @@ key at all; only the synthesized-answer step does.
   publish them to the DCP package manager (see Gotcha 19 and the naming
   scheme above). Run `build` then `publish` after `prepare-models.js`, and
   again any time a model's dtype/checkpoint changes and needs a version bump.
+- `scripts/patch-deps.js` — patches a WebGPU self-location crash directly
+  into `node_modules/onnxruntime-web`'s minified source (see Gotcha 16);
+  runs automatically via `postinstall`, never needs to be run by hand.
