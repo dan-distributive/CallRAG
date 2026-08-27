@@ -13,6 +13,7 @@
 // "this is the same Alice across all 50 calls".
 require('./polyfills');
 const installModelFetchPatch = require('./modelFetchPatch');
+const { loadWithGpuFallback } = require('./gpuFallback');
 
 let modelPromise = null;
 /**
@@ -25,14 +26,18 @@ function getModel(modelFiles) {
     require('./setupOrt')(env);
     env.useBrowserCache = false;
     env.allowLocalModels = false;
-    modelPromise = Promise.all([
-      AutoModelForAudioFrameClassification.from_pretrained('onnx-community/pyannote-segmentation-3.0', {
-        device: 'wasm',
-        dtype: 'fp32', // tiny model (~6MB) -- no need to fight the QDQ/quantization crash at all
-        session_options: { graphOptimizationLevel: 'disabled' }, // same fix as whisper/bge-small, cheap insurance
-      }),
-      AutoProcessor.from_pretrained('onnx-community/pyannote-segmentation-3.0'),
-    ]);
+    modelPromise = loadWithGpuFallback(
+      (device) =>
+        Promise.all([
+          AutoModelForAudioFrameClassification.from_pretrained('onnx-community/pyannote-segmentation-3.0', {
+            device,
+            dtype: 'fp32', // tiny model (~6MB) -- no need to fight the QDQ/quantization crash at all
+            ...(device === 'wasm' ? { session_options: { graphOptimizationLevel: 'disabled' } } : {}), // same fix as whisper/bge-small, wasm-only
+          }),
+          AutoProcessor.from_pretrained('onnx-community/pyannote-segmentation-3.0'),
+        ]),
+      'pyannote',
+    );
   }
   return modelPromise;
 }

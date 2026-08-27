@@ -14,7 +14,9 @@ session) doesn't have to rediscover them.
 
 ```
 npm install
-node scripts/prepare-models.js   # downloads + embeds the models below (~314MB of local cache; one-time)
+node scripts/prepare-models.js         # downloads + embeds the models below (~314MB of local cache; one-time)
+node scripts/build-model-packages.js   # wraps them for publishing (see "Published package" below)
+node scripts/publish-model-packages.js # publishes to the DCP package manager (one-time, or after a version bump)
 ```
 
 You'll also need a DCP identity/wallet — see `dcp-client`'s own docs if you
@@ -23,8 +25,9 @@ and `computeGroups: [{ joinKey: 'ibm', joinSecret: 'dcp' }]` hardcoded near
 the top, which you'll want to change to your own.
 
 ```
-node ingest.js path/to/your/mp3s     # dispatches one DCP job, transcribes+diarizes+embeds every new file
-node server.js                        # viewer + query UI at http://localhost:8177
+node ingest.js path/to/your/mp3s             # dispatches one DCP job, transcribes+diarizes+embeds every new file
+node ingest.js path/to/your/mp3s --webgpu    # same, but restricted to GPU-capable workers (see Gotcha 17)
+node server.js                                # viewer + query UI at http://localhost:8177
 ```
 
 `node query.js "<question>"` also works standalone from the terminal if you
@@ -55,13 +58,13 @@ that dispatch overhead isn't worth it.
 
 ## The model stack, and what else fits
 
-| Stage | Current model | Size (as shipped) | Bigger alternative | Size | Smaller alternative | Size |
-|---|---|---|---|---|---|---|
-| Transcription | `Xenova/whisper-base.en` (uint8) | ~100MB | whisper-small.en | ~237MB | whisper-tiny.en | ~57MB |
-| | | | whisper-medium.en | ~740MB | | |
-| Diarization | `onnx-community/pyannote-segmentation-3.0` (fp32) | 7.6MB | *(no bigger segmentation variant — better diarization means adding a speaker-embedding model, not a bigger segmentation model)* | | int8/quantized | ~1.5MB |
-| Text embedding | `Xenova/bge-small-en-v1.5` (q8) | ~46MB | bge-base-en-v1.5 | ~105MB | all-MiniLM-L6-v2 | ~22MB |
-| Speaker identity | `Xenova/wavlm-base-plus-sv` (q8) | ~129MB | — (fp32, ~384MB) | ~384MB | — | — |
+| Stage | Current model | Size (as shipped) | Published package | Bigger alternative | Size | Smaller alternative | Size |
+|---|---|---|---|---|---|---|---|
+| Transcription | `Xenova/whisper-base.en` (uint8) | ~100MB | `callrag-whisper-base-en-uint8` | whisper-small.en | ~237MB | whisper-tiny.en | ~57MB |
+| | | | | whisper-medium.en | ~740MB | | |
+| Diarization | `onnx-community/pyannote-segmentation-3.0` (fp32) | 7.6MB | `callrag-pyannote-seg3-fp32` | *(no bigger segmentation variant — better diarization means adding a speaker-embedding model, not a bigger segmentation model)* | | int8/quantized | ~1.5MB |
+| Text embedding | `Xenova/bge-small-en-v1.5` (q8) | ~46MB | `callrag-bge-small-en-q8` | bge-base-en-v1.5 | ~105MB | all-MiniLM-L6-v2 | ~22MB |
+| Speaker identity | `Xenova/wavlm-base-plus-sv` (q8) | ~129MB | `callrag-wavlm-base-sv-q8` | — (fp32, ~384MB) | ~384MB | — | — |
 
 Swapping any of these is mechanically cheap — `dtype` and `modelName` are
 already parameters on `transcribeAudio()`/`embedText()`, and every model
@@ -69,21 +72,38 @@ ships as a `{filename: base64}` map. The expensive part is re-validating
 the model against the gotchas below (QDQ crash, size ceiling, `device`
 value), not the code change itself.
 
+**Naming scheme for published packages**, since more models (bigger and
+smaller) will likely get added over time: `callrag-<model>-<dtype>`, plain
+semver starting at `1.0.0`. The `callrag-` prefix groups everything in the
+DCP package manager's flat, global namespace (no `@org/` scoping exists);
+the dtype suffix is part of the name, not just the version, because a
+different quantization is a structurally different set of files, not a
+revision of the same one — so `callrag-whisper-base-en-uint8` and a
+hypothetical future `callrag-whisper-small-en-fp16` coexist cleanly.
+Version bumps: patch for a re-export/bugfix, minor if the shipped file set
+changes, major if the underlying checkpoint/revision is swapped entirely.
+See `scripts/build-model-packages.js` / `scripts/publish-model-packages.js`,
+and docs.dcp.dev's "Publishing a DCP package" for the publish mechanics and
+the filename-collision gotcha (every package's file needs a **globally
+distinct basename**, not `model.js` — `require()` inside a job takes just
+the bare filename with no package prefix, so two packages both naming their
+file `model.js` would collide the moment one job needed both).
+
 ## Current per-worker payload
 
 Every `ingest.js` job dispatch ships this much data to whichever worker
-picks up a slice, split across two transports (see Gotcha 3):
+picks up a slice:
 
 | Transport | Contents | Size |
 |---|---|---|
-| `job.requires()` (webpack-bundled locally, then shipped) | `base64.js`, `decodeMp3.js` + `decoderWasmBase64.js`, `resample.js`, `vad.js`, `transcribeAudio.js`, `embedText.js`, `diarize.js`, `speakerEmbed.js`, `setupOrt.js` + **`ortWasmAsyncifyBase64.js`**, `modelFetchPatch.js`, `polyfills.js` | **~30.0MB** (almost entirely the onnxruntime-web wasm binary) |
-| Job arguments (kvin-serialized, not bundled) | whisper-base.en, bge-small, pyannote-segmentation, wavlm-base-plus-sv model files + known voice profiles | **~281.6MB** (~100.4MB + ~44.2MB + ~7.6MB + ~129.4MB) |
-| **Total per slice** | | **~311.6MB** |
+| `job.requires()` (webpack-bundled locally, then shipped) | `base64.js`, `decodeMp3.js` + `decoderWasmBase64.js`, `resample.js`, `vad.js`, `transcribeAudio.js`, `embedText.js`, `diarize.js`, `speakerEmbed.js`, `setupOrt.js` + `ortWasmAsyncifyBase64.js` + `ortWasmAsyncifyMjsBase64.js`, `modelFetchPatch.js`, `polyfills.js`, `gpuFallback.js` | ~30.1MB (almost entirely the onnxruntime-web wasm binary) |
+| `job.requires()` (published packages, pulled once, cached per worker) | the four `callrag-*` model packages above | 0 bytes re-sent per dispatch after the first pull |
+| Job arguments (kvin-serialized) | known voice profiles only | ~29KB |
+| **Total per slice** | | **~30.1MB** |
 
-That's a lot of data re-sent per file. It's not currently cached
-worker-side across slices of the same job (each slice is an independent
-sandbox) — a real optimization opportunity if ingesting a large backlog
-gets slow on the dispatch/upload side rather than the compute side.
+This used to be ~311.6MB (the four model files shipped as job arguments,
+re-serialized fresh on every single dispatch) — see Gotchas 17–18 for why
+that broke down and what replaced it.
 
 ## Gotchas, in the order they actually bit
 
@@ -238,6 +258,53 @@ gets slow on the dispatch/upload side rather than the compute side.
     entirely (commented out, not deleted, in case a real future WebGPU
     attempt wants it back).
 
+16. **WebGPU's real crash root cause, found and fixed** — Gotcha 6's
+    "uncatchable" crash turned out to be onnxruntime-web's WebGPU (JSEP)
+    backend doing a genuine dynamic `import()` of a relative companion
+    `.mjs` file during session init, which can never resolve under DCP's
+    sandboxed `eval` (base URL is `about:blank`). Fixed by setting
+    `env.backends.onnx.wasm.wasmPaths.mjs` to a `data:` URL (needs no base
+    URL to resolve) in `setupOrt.js` — confirmed via a real dispatch:
+    Whisper loaded and ran inference on `device: 'webgpu'` end to end. Full
+    escalation-ladder writeup (bare WebGPU → raw onnxruntime-web → full
+    transformers.js pipeline, each rung a real DCP dispatch): docs.dcp.dev's
+    "Getting WebGPU-accelerated libraries working in DCP work functions."
+
+17. **`gpuFallback.js` tries `device: 'webgpu'` first on every model load,
+    falling back to `device: 'wasm'` on any failure** (all four
+    model-loading modules route through it) — but this is only ever
+    _reachable_ on workers the dispatch actually requested via
+    `job.requirements.environment.webgpu = true` (see Gotcha 15): DCP's
+    sandbox only exposes `navigator.gpu` at all when that flag was set at
+    dispatch time, and setting it also restricts scheduling to
+    GPU-capable workers only (one flag does both jobs — there's no way to
+    request opportunistic-if-present GPU access without also narrowing the
+    worker pool). `ingest.js` exposes this as `--webgpu`
+    (`node ingest.js <dir> --webgpu`): omit it to run wasm-only across the
+    full pool (the default), pass it to restrict to the `ibm` compute
+    group's GPU-capable workers and actually exercise the webgpu path.
+
+18. **`dcp-client`'s own job-argument serialization breaks down well before
+    any documented size ceiling — confirmed at ~300MB.** The four model
+    files shipped as job arguments totaled ~281.6MB and reliably crashed
+    dispatch with `DCPError: connection closed` (Engine.IO's underlying
+    WebSocket has a 60s `pingTimeout`; pushing that much data apparently
+    starves the small ping/pong control frames long enough to trip it). An
+    isolated ~300MB job-argument reproduction, with no model-file specifics
+    at all, crashed harder and earlier: a hard V8 out-of-memory inside
+    `dcp-client`'s own `JSON.stringify`, before the payload ever reached the
+    network. Both are the same underlying problem — this transport doesn't
+    scale to payloads in the hundreds-of-MB range, full stop.
+
+19. **Fix for Gotcha 18: publish large/shared model weights as DCP packages
+    instead of job arguments.** Publishing uploads each model file exactly
+    once; every dispatch after that pulls the cached package via
+    `job.requires(['pkgname/file.js'])` instead of re-serializing the whole
+    thing. Confirmed clean up to 129.4MB (no ceiling hit, 2.4–34.7s to
+    publish, roughly linear with size) — see the naming-scheme section
+    above and docs.dcp.dev's "Publishing a DCP package" for the full
+    mechanics, including the filename-collision gotcha this surfaced.
+
 ## Speaker identity (voice-fingerprint matching)
 
 `pyannote-segmentation-3.0` alone only answers "when did the speaker
@@ -315,8 +382,11 @@ key at all; only the synthesized-answer step does.
   whisper-base.en upgrade and the sample-rate fix, but Whisper's
   repetition-loop failure mode on quiet/low-confidence audio hasn't been
   eliminated, only reduced.
-- **~312MB re-shipped per worker per file** (see payload table above) —
-  no cross-slice model caching exists yet.
+- **The chat/query-time embedding path (`queryEngine.js`) still loads
+  `bge-small` from a local base64 file, not the published package** — it
+  runs locally (no DCP dispatch), so the job-argument payload problem
+  Gotcha 18/19 fixes never applied to it; nothing to gain from switching it
+  over, so it wasn't touched.
 
 ## File reference
 
@@ -337,10 +407,12 @@ key at all; only the synthesized-answer step does.
   than importing them, so any module can ship via `job.requires()`, a job
   argument, or a published package without the others knowing.
 - `modelFetchPatch.js`, `setupOrt.js`, `polyfills.js`, `base64.js`,
-  `callDate.js` — shared DCP-sandbox-compatibility shims and small utilities
-  (see Gotchas 2, 4, 9 in spirit).
+  `callDate.js`, `gpuFallback.js` — shared DCP-sandbox-compatibility shims
+  and small utilities (see Gotchas 2, 4, 9, 16–17 in spirit).
 - `scripts/prepare-models.js` — downloads and embeds the model bundles
   (gitignored — see Setup above).
-- `stage0`–`stage4` scripts — the original incremental proofs (basic
-  dispatch → mp3 decode → transformers.js pipeline → full pipeline),
-  kept as standalone regression checks for individual stages.
+- `scripts/build-model-packages.js` / `scripts/publish-model-packages.js`
+  — wrap the model bundles into bravojs's `module.declare()` format and
+  publish them to the DCP package manager (see Gotcha 19 and the naming
+  scheme above). Run `build` then `publish` after `prepare-models.js`, and
+  again any time a model's dtype/checkpoint changes and needs a version bump.

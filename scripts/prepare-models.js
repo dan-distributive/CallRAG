@@ -65,11 +65,20 @@ async function main() {
     'onnx/model_quantized.onnx': `${wavlm}/onnx/model_quantized.onnx`,
   });
 
-  console.log('embedding onnxruntime-web wasm binary...');
+  console.log('embedding onnxruntime-web wasm binary + mjs glue file...');
   const ortWasm = path.join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm');
   const wasmBase64 = fs.readFileSync(ortWasm).toString('base64');
   fs.writeFileSync(path.join(ROOT, 'ortWasmAsyncifyBase64.js'), `module.exports = ${JSON.stringify(wasmBase64)};\n`);
   console.log(`wrote ortWasmAsyncifyBase64.js (${(wasmBase64.length / 1024 / 1024).toFixed(1)}MB)`);
+
+  // Needed by setupOrt.js's wasmPaths.mjs fix -- see docs.dcp.dev's "Getting
+  // WebGPU-accelerated libraries working in DCP work functions" for why the
+  // webgpu backend needs this (a dynamic import() the plain wasm backend
+  // never does) and why a data: URL is the fix for DCP's sandboxed eval.
+  const ortMjs = path.join(ROOT, 'node_modules/onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs');
+  const mjsBase64 = fs.readFileSync(ortMjs).toString('base64');
+  fs.writeFileSync(path.join(ROOT, 'ortWasmAsyncifyMjsBase64.js'), `module.exports = ${JSON.stringify(mjsBase64)};\n`);
+  console.log(`wrote ortWasmAsyncifyMjsBase64.js (${(mjsBase64.length / 1024).toFixed(0)}KB)`);
 
   console.log('\nAll model bundles generated. Run `node ingest.js <dir>` to ingest mp3s.');
 }

@@ -11,6 +11,7 @@
 // signal at the same normalization this module uses.
 require('./polyfills');
 const installModelFetchPatch = require('./modelFetchPatch');
+const { loadWithGpuFallback } = require('./gpuFallback');
 
 let modelPromise = null;
 /**
@@ -23,14 +24,18 @@ function getModel(modelFiles) {
     require('./setupOrt')(env);
     env.useBrowserCache = false;
     env.allowLocalModels = false;
-    modelPromise = Promise.all([
-      AutoModel.from_pretrained('Xenova/wavlm-base-plus-sv', {
-        device: 'wasm',
-        dtype: 'q8',
-        session_options: { graphOptimizationLevel: 'disabled' }, // same qdq_actions.cc fix as every other quantized model in this stack
-      }),
-      AutoProcessor.from_pretrained('Xenova/wavlm-base-plus-sv'),
-    ]);
+    modelPromise = loadWithGpuFallback(
+      (device) =>
+        Promise.all([
+          AutoModel.from_pretrained('Xenova/wavlm-base-plus-sv', {
+            device,
+            dtype: 'q8',
+            ...(device === 'wasm' ? { session_options: { graphOptimizationLevel: 'disabled' } } : {}), // same qdq_actions.cc fix as every other quantized model in this stack, wasm-only
+          }),
+          AutoProcessor.from_pretrained('Xenova/wavlm-base-plus-sv'),
+        ]),
+      'wavlm',
+    );
   }
   return modelPromise;
 }

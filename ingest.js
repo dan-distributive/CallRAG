@@ -72,8 +72,23 @@ async function main() {
     sourceFile: f,
   }));
 
-  async function pipelineWork(unit, whisperModelFiles, bgeModelFiles, pyannoteModelFiles, wavlmModelFiles, voiceProfiles) {
+  async function pipelineWork(unit, voiceProfiles) {
     progress(0);
+    // Model weights come from published DCP packages (see
+    // scripts/build-model-packages.js / scripts/publish-model-packages.js
+    // and docs.dcp.dev's "Publishing a DCP package") rather than job
+    // arguments -- shipping ~281MB of base64 model data fresh on every
+    // dispatch was overflowing dcp-client's own job-argument serialization
+    // (confirmed: an isolated ~300MB job-argument reproduced a hard V8 OOM
+    // inside dcp-client's JSON.stringify, and the real dispatch hit
+    // "DCPError: connection closed" from the same underlying payload-size
+    // pressure). Publishing uploads each model once; every dispatch after
+    // that just pulls the cached package -- confirmed clean up to 129MB
+    // with no size ceiling hit, published in 2-35s each.
+    const whisperModelFiles = require('whisper-model.js'); // callrag-whisper-base-en-uint8
+    const bgeModelFiles = require('bge-model.js'); // callrag-bge-small-en-q8
+    const pyannoteModelFiles = require('pyannote-model.js'); // callrag-pyannote-seg3-fp32
+    const wavlmModelFiles = require('wavlm-model.js'); // callrag-wavlm-base-sv-q8
     const base64 = require('./base64');
     const decodeMp3 = require('./decodeMp3');
     const { resample } = require('./resample');
@@ -215,24 +230,30 @@ async function main() {
     return { sourceFile: unit.sourceFile, segments, embedded, embedError, timings };
   }
 
-  // Both model bundles ship as job ARGUMENTS, not job.requires() -- both
-  // whisper-base.en (~100MB base64) and even bge-small (~46MB) risk the
-  // local webpack bundler's ERR_WORKER_OUT_OF_MEMORY ceiling once combined
-  // into one job requiring both, so keep both on the transport already
-  // proven safe at this size.
-  const whisperModelFiles = require('./whisperBaseEnModelFilesBase64');
-  const bgeModelFiles = require('./bgeSmallModelFilesBase64');
-  const pyannoteModelFiles = require('./pyannoteModelFilesBase64'); // tiny (~7.6MB); shipped as a job argument for consistency with the other two models, though job.requires() would work fine at this size too
-  const wavlmModelFiles = require('./wavlmModelFilesBase64'); // ~129MB -- job argument, well past the job.requires() ceiling
   // Known named voices, built up via the viewer's speaker-naming endpoint
   // (see server.js) -- passed in fresh on every dispatch so newly-named
   // speakers get recognized on the NEXT file processed, not retroactively.
+  // This is the only job argument left -- it's tiny (~29KB) and genuinely
+  // needs to be fresh per dispatch, unlike the model weights below.
   const voiceProfiles = readJSON(`${resultsDir}/voiceProfiles.json`, {});
-  
+
   // DCP JOB
-  const job = compute.for(inputSet, pipelineWork, [whisperModelFiles, bgeModelFiles, pyannoteModelFiles, wavlmModelFiles, voiceProfiles]);
-  
-  // Require local modules
+  const job = compute.for(inputSet, pipelineWork, [voiceProfiles]);
+
+  // Require local modules + published model packages. Model weights used
+  // to ship as job arguments (~281MB combined, re-serialized on every
+  // dispatch) -- that overflowed dcp-client's own job-argument
+  // serialization (a hard V8 OOM on an isolated ~300MB reproduction, and
+  // "DCPError: connection closed" on the real dispatch, both from the same
+  // payload-size pressure). Publishing them once as packages and pulling
+  // via job.requires() instead sends nothing extra on any dispatch after
+  // the first -- see scripts/build-model-packages.js,
+  // scripts/publish-model-packages.js, and docs.dcp.dev's "Publishing a
+  // DCP package". Every file each package needs must be listed explicitly
+  // here, not just the package name -- job.requires() only auto-discovers
+  // ~2 levels of declared dependencies for multi-file packages (not an
+  // issue for these single-file packages, but listed per-package for
+  // clarity/consistency anyway).
   job.requires([
     './base64',
     './decodeMp3',
@@ -241,24 +262,32 @@ async function main() {
     './transcribeAudio',
     './embedText',
     './diarize',
-    './speakerEmbed'
+    './speakerEmbed',
+    './gpuFallback',
+    './ortWasmAsyncifyMjsBase64', // needed by setupOrt.js for the webgpu-attempt path -- see docs.dcp.dev's WebGPU guide
+    'callrag-whisper-base-en-uint8/whisper-model.js',
+    'callrag-bge-small-en-q8/bge-model.js',
+    'callrag-pyannote-seg3-fp32/pyannote-model.js',
+    'callrag-wavlm-base-sv-q8/wavlm-model.js',
   ]);
 
   // COMPUTE GROUP(S)
   job.computeGroups = [
-    { joinKey: 'ssc-icelab', joinSecret: 'r2whez1w' }
+    { joinKey: 'ibm', joinSecret: 'dcp' }
   ];
 
   // JOB REQUIREMENTS
-  // NOT `{ webgpu: true }` -- this whole pipeline runs on device:'wasm'
-  // (CPU) everywhere; WebGPU was investigated and shelved (uncatchable
-  // crash in onnxruntime-web's JSEP session creation -- see README Gotcha
-  // 6). Requiring webgpu:true here restricted the eligible worker pool to
-  // only GPU-capable devices for a capability nothing in the job actually
-  // uses -- confirmed as the real cause of a dispatch that looked "stuck"
-  // for 50+ minutes (an empty compute group was the first suspicion, but
-  // this was the actual blocker: plenty of workers existed, almost none of
-  // them GPU-capable).
+  // webgpu:true restricts the eligible worker pool to only GPU-capable
+  // devices -- confirmed as the real cause of a dispatch that once looked
+  // "stuck" for 50+ minutes (plenty of workers existed, almost none of them
+  // GPU-capable -- see README Gotcha 15). gpuFallback.js tries webgpu
+  // unconditionally and falls back to wasm regardless of this flag, so
+  // toggling it doesn't change correctness -- it only chooses which worker
+  // pool this dispatch is offered to: leave it off to run wasm-only across
+  // the full (mostly CPU) pool, or pass --webgpu to restrict to a
+  // GPU-capable compute group and actually get the webgpu speedup.
+  const useWebgpu = process.argv.includes('--webgpu');
+  if (useWebgpu) job.requirements.environment = { webgpu: true };
 
   // JOB PUBLIC INFO
   job.public = { 
@@ -283,4 +312,7 @@ async function main() {
   // EXEC
   await job.exec();
 }
-require('dcp-client').init('https://scheduler.distributed.computer').then(main);
+require('dcp-client').init('https://scheduler.distributed.computer').then(main).catch((err) => {
+  console.error('ingest failed:', err.message);
+  process.exit(1);
+});

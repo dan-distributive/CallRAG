@@ -6,6 +6,7 @@
 // whatever fits).
 require('./polyfills'); // AbortController -- see polyfills.js
 const installModelFetchPatch = require('./modelFetchPatch');
+const { loadWithGpuFallback } = require('./gpuFallback');
 
 let pipelinePromise = null;
 /**
@@ -20,21 +21,25 @@ function getTranscriber(modelFiles, dtype, modelName) {
     require('./setupOrt')(env); // must come after importing transformers.js -- see setupOrt.js
     env.useBrowserCache = false;
     env.allowLocalModels = false;
-    pipelinePromise = pipeline('automatic-speech-recognition', modelName, {
-      device: 'wasm', // see dcp_transformers_restart memory: 'wasm' on the real (browser-hosted) DCP worker, not 'cpu' (that's the local-Node-only value)
-      dtype,
-      // qdq_actions.cc:137 TransposeDQWeightsForMatMulNBits crashes session
-      // creation for ANY QDQ-format graph on this sandbox's onnxruntime-web
-      // (hit identically at q8, uint8, and fp32 -- whisper's merged decoder
-      // always has at least one DequantizeLinear node, used for weight-
-      // sharing between its with/without-past branches even at fp32). That's
-      // a graph-optimization fusion pass, not a hard runtime limitation --
-      // disabling extended optimizations skips the fusion and runs QDQ nodes
-      // as plain (slower but correct) DequantizeLinear + MatMul ops instead.
-      // Testing whether this makes quantized dtypes viable again, which
-      // would sidestep the fp32 job.requires()-size problem entirely.
-      session_options: { graphOptimizationLevel: 'disabled' },
-    });
+    pipelinePromise = loadWithGpuFallback(
+      (device) =>
+        pipeline('automatic-speech-recognition', modelName, {
+          device, // 'wasm' on the real (browser-hosted) DCP worker, not 'cpu' (that's the local-Node-only value) -- see dcp_transformers_restart memory
+          dtype,
+          // qdq_actions.cc:137 TransposeDQWeightsForMatMulNBits crashes
+          // session creation for ANY QDQ-format graph on this sandbox's
+          // onnxruntime-web wasm backend specifically (hit identically at
+          // q8, uint8, and fp32 -- whisper's merged decoder always has at
+          // least one DequantizeLinear node, used for weight-sharing
+          // between its with/without-past branches even at fp32). A
+          // graph-optimization fusion-pass bug, not a hard runtime
+          // limitation -- disabling extended optimizations skips it.
+          // Confirmed NOT needed on webgpu (a real dispatch succeeded with
+          // no override at all), so only apply it for the wasm fallback.
+          ...(device === 'wasm' ? { session_options: { graphOptimizationLevel: 'disabled' } } : {}),
+        }),
+      'whisper',
+    );
   }
   return pipelinePromise;
 }

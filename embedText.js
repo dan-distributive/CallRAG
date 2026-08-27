@@ -5,6 +5,7 @@
 // package without the other knowing.
 require('./polyfills'); // AbortController -- see polyfills.js
 const installModelFetchPatch = require('./modelFetchPatch');
+const { loadWithGpuFallback } = require('./gpuFallback');
 
 let pipelinePromise = null;
 /**
@@ -17,14 +18,17 @@ function getEmbedder(modelFiles) {
     require('./setupOrt')(env); // must come after importing transformers.js -- see setupOrt.js
     env.useBrowserCache = false;
     env.allowLocalModels = false;
-    pipelinePromise = pipeline('feature-extraction', 'Xenova/bge-small-en-v1.5', {
-      device: 'wasm', // 'wasm' on the real (browser-hosted) DCP worker, not 'cpu' -- see dcp_transformers_restart memory
-      dtype: 'q8',
-      // Same qdq_actions.cc/TransposeDQWeightsForMatMulNBits session-creation
-      // crash as whisper hits at quantized dtypes -- disabling the fusion
-      // pass avoids it here too. See transcribeAudio.js / dcp_transformers_restart memory.
-      session_options: { graphOptimizationLevel: 'disabled' },
-    });
+    pipelinePromise = loadWithGpuFallback(
+      (device) =>
+        pipeline('feature-extraction', 'Xenova/bge-small-en-v1.5', {
+          device, // 'wasm' on the real (browser-hosted) DCP worker, not 'cpu' -- see dcp_transformers_restart memory
+          dtype: 'q8',
+          // Same qdq_actions.cc/TransposeDQWeightsForMatMulNBits crash as
+          // whisper hits, wasm-backend-specific -- see transcribeAudio.js.
+          ...(device === 'wasm' ? { session_options: { graphOptimizationLevel: 'disabled' } } : {}),
+        }),
+      'bge-small',
+    );
   }
   return pipelinePromise;
 }
