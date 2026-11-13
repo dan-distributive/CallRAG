@@ -21,7 +21,7 @@ node scripts/publish-model-packages.js # publishes to the DCP package manager (o
 
 You'll also need a DCP identity/wallet — see `dcp-client`'s own docs if you
 don't already have one; `ingest.js` currently has a placeholder private key
-and `computeGroups: [{ joinKey: 'ibm', joinSecret: 'dcp' }]` hardcoded near
+and `computeGroups: [{ attachKey: 'ibm', attachSecret: 'dcp' }]` hardcoded near
 the top, which you'll want to change to your own.
 
 ```

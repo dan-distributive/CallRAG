@@ -16,7 +16,7 @@
   "type": "commonjs",
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
-    "dcp-client": "^5.8.2",
+    "dcp-client": "^5.9.0",
     "minimp3-wasm": "^0.1.0"
   }
 }

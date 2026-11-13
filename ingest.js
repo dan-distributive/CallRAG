@@ -273,7 +273,7 @@ async function main() {
 
   // COMPUTE GROUP(S)
   job.computeGroups = [
-    { joinKey: 'ibm', joinSecret: 'dcp' }
+    { attachKey: 'ibm', attachSecret: 'dcp' }
   ];
 
   // JOB REQUIREMENTS
